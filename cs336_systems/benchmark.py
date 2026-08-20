@@ -60,13 +60,17 @@ def benchmark(
         theta: float = 10000.0,
         warmup_steps: int = 5,
         time_steps: int = 10,
-        profile: bool = False
+        profile: bool = False,
+        compiled: bool = False
 ):
 
     device = torch.device(device)
+    torch.set_float32_matmul_precision('high')
 
     if profile:
         basics_model.attention = annotated_attention
+    if compiled:
+        basics_model.TransformerLM = torch.compile(TransformerLM)
 
     model = TransformerLM(
         vocab_size,
@@ -249,7 +253,6 @@ def benchmark(
             optimizer_end = default_timer()
             optimizer_times[i] = optimizer_end - optimizer_start
 
-        statistics = {}
         statistics["forward_mean"] = (forward_times * 1000).mean()
         statistics["forward_std"] = (forward_times * 1000).std()
         statistics["backward_mean"] = (backward_times * 1000).mean()
@@ -264,7 +267,7 @@ def benchmark(
     
 def main():
     parser = argparse.ArgumentParser(
-        description="Train a language model."
+        description="Benchmark a transformer model."
     )
 
     parser.add_argument(
@@ -322,6 +325,10 @@ def main():
         default=512
     )
 
+    parser.add_argument(
+        "--compiled",
+        action="store_true",
+    )
 
     args = parser.parse_args()
     mode = args.mode
@@ -333,7 +340,7 @@ def main():
     warmup_steps = args.warmup_steps
     time_steps = args.time_steps
 
-    statistics = benchmark(mode, d_model, d_ff, num_layers, num_heads, warmup_steps=warmup_steps, time_steps=time_steps, profile=args.profile, context_length=args.context_length)
+    statistics = benchmark(mode, d_model, d_ff, num_layers, num_heads, warmup_steps=warmup_steps, time_steps=time_steps, profile=args.profile, context_length=args.context_length, compiled=args.compiled)
 
     df = pd.DataFrame([{
         "size": size,
@@ -342,9 +349,13 @@ def main():
         **statistics,
     }])
 
-    output_dir = Path("profile" if args.profile else "benchmark")
+    if args.profile:
+        output_dir = Path("profile")
+    elif args.compiled:
+        output_dir = Path("benchmark_compiled")
+    else:
+        output_dir = Path("benchmark")
     output_dir.mkdir(parents=True, exist_ok=True)
-
     output_filepath = output_dir / (
         f"{mode}-{size}"
         f"-ctx{args.context_length}"
@@ -358,5 +369,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
         

@@ -34,7 +34,7 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
-def benchmark_fsdp(rank, world_size, mode, profile, batch_size, context_length):
+def benchmark_fsdp(rank, world_size, profile, batch_size, context_length):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
     
@@ -48,7 +48,7 @@ def benchmark_fsdp(rank, world_size, mode, profile, batch_size, context_length):
         theta,
         device
     )
-    fsdp_model = FSDP(model)
+    fsdp_model = FSDP(model, compute_dtype=torch.float16, enable_nvtx=profile)
     
     input_batch = torch.randint(
         0, vocab_size, 
@@ -88,7 +88,7 @@ def benchmark_fsdp(rank, world_size, mode, profile, batch_size, context_length):
     if profile:
         optimizer.zero_grad(set_to_none=True)
         dist.barrier()
-
+        torch.cuda.synchronize()
         with nvtx.range("profile"):
             with nvtx.range("forward"):
                 logits = fsdp_model(input_batch)
@@ -109,13 +109,12 @@ def benchmark_fsdp(rank, world_size, mode, profile, batch_size, context_length):
         # Benchmark
         n_iters = 10
         total_times = np.zeros(n_iters)
-        comm_times = np.zeros(n_iters)
         # Time full training step
         for i in range(n_iters):
             # Clear gradients from the previous step
-            optimizer.zero_grad()
-            torch.cuda.synchronize()
+            optimizer.zero_grad(set_to_none=True)
             dist.barrier()
+            torch.cuda.synchronize()
             forward_start = time.perf_counter()
             # Forward pass
             logits = fsdp_model(input_batch)
@@ -134,7 +133,6 @@ def benchmark_fsdp(rank, world_size, mode, profile, batch_size, context_length):
         dist.all_gather(gathered_total_mean, total_time_mean)
         if rank == 0:
             print(
-                f"mode={mode}, "
                 f"world_size={world_size}, "
                 f"batch_size={batch_size}, "
                 f"context_length={context_length}"
@@ -164,7 +162,7 @@ def main():
     context_length = 512
     mp.spawn(
         fn=benchmark_fsdp, 
-        args=(world_size, args.mode, args.profile, batch_size, context_length), 
+        args=(world_size, args.profile, batch_size, context_length), 
         nprocs=world_size, 
         join=True
     )

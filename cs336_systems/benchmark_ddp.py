@@ -95,7 +95,7 @@ def benchmark_ddp(rank, world_size, mode, profile, batch_size, context_length):
     if profile:
         optimizer.zero_grad(set_to_none=True)
         dist.barrier()
-
+        torch.cuda.synchronize()
         with nvtx.range("profile"):
             with nvtx.range("forward"):
                 logits = ddp_model(input_batch)
@@ -120,9 +120,9 @@ def benchmark_ddp(rank, world_size, mode, profile, batch_size, context_length):
         # Time full training step
         for i in range(n_iters):
             # Clear gradients from the previous step
-            optimizer.zero_grad()
-            torch.cuda.synchronize()
+            optimizer.zero_grad(set_to_none=True)
             dist.barrier()
+            torch.cuda.synchronize()
             forward_start = time.perf_counter()
             # Forward pass
             logits = ddp_model(input_batch)
@@ -154,7 +154,7 @@ def benchmark_ddp(rank, world_size, mode, profile, batch_size, context_length):
             # Time communication  
             for i in range(n_iters):
                 # Clear gradients from the previous step
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 # Forward pass
                 logits = ddp_model(input_batch)
                 # Compute loss
@@ -162,7 +162,8 @@ def benchmark_ddp(rank, world_size, mode, profile, batch_size, context_length):
                 # Compute gradients
                 loss.backward()
                 torch.cuda.synchronize()
-                dist.barrier()  
+                dist.barrier()
+                torch.cuda.synchronize() 
                 comm_start = time.perf_counter()
                 ddp_model.finish_gradient_synchronization()
                 torch.cuda.synchronize()

@@ -5,6 +5,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from cs336_basics.model import Linear, Embedding
 import torch.nn.functional as F
+import torch.cuda.nvtx as nvtx
+from contextlib import nullcontext
 
 class NaiveFSDP(nn.Module):
 
@@ -145,13 +147,15 @@ class FSDP(nn.Module):
     def __init__(
         self, 
         module: torch.nn.Module, 
-        compute_dtype: torch.dtype | None = None
+        compute_dtype: torch.dtype | None = None,
+        enable_nvtx: bool = False
     ):
         super().__init__()
         self.module = module
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
         self.compute_dtype = compute_dtype
+        self.enable_nvtx = enable_nvtx
         self._shardable_params = {}
         self._grad_sync_handles = []
         self._shardable_grad_sync_handles = []
@@ -159,6 +163,10 @@ class FSDP(nn.Module):
         self._layer_order = []  # execution order of Linear or Embedding layers
         self._inspect_hook_handles = []
         self._pending_gathers = {}
+        self._param_names = {
+            id(param): name
+            for name, param in self.module.named_parameters()
+        }
 
         # Broadcast model parameters and buffers from rank 0 to all other ranks
         with torch.no_grad():
@@ -206,13 +214,26 @@ class FSDP(nn.Module):
             if param_id not in self._pending_gathers:
                 self._start_gather(param_id)
             record = self._pending_gathers[param_id]
-            record["handle"].wait()
+            param_name = self._param_names[param_id]
+            param = self._shardable_params[param_id]["param"]
+            context = (
+                nvtx.range(f"all-gather wait: {param_name}")
+                if self.enable_nvtx and param.is_cuda
+                else nullcontext()
+            )
+            with context:
+                record["handle"].wait()
             self._finish_gather(param_id)
             del self._pending_gathers[param_id]
+            if self.enable_nvtx and param.is_cuda:
+                nvtx.range_push(f"layer forward: {param_name}")
         return sync_weight
 
     def _make_forward_post_hook(self, param_id):
         def restore_local_shard(module, args, output):
+            param = self._shardable_params[param_id]["param"]
+            if self.enable_nvtx and param.is_cuda:
+                nvtx.range_pop()
             if output.requires_grad:
                 output.register_hook(
                     self._make_backward_pre_hook(param_id)
@@ -307,7 +328,14 @@ class FSDP(nn.Module):
         shard_data = shard_metadata["shard_data"]
         gathered_param_data = torch.empty(int(shard_size * self.world_size), dtype=compute_dtype, device=shard_data.device)
         local_data = shard_data.to(compute_dtype)
-        handle = dist.all_gather_into_tensor(gathered_param_data, local_data, async_op=True)
+        param_name = self._param_names[param_id]
+        context = (
+            nvtx.range(f"all-gather launch: {param_name}")
+            if self.enable_nvtx and shard_data.is_cuda
+            else nullcontext()
+        )
+        with context:
+            handle = dist.all_gather_into_tensor(gathered_param_data, local_data, async_op=True)
         self._pending_gathers[param_id] = {
             "handle": handle,
             "gathered_data": gathered_param_data,

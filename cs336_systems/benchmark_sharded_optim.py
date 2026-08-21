@@ -190,9 +190,9 @@ def benchmark_optim(rank, world_size, mode, batch_size, context_length):
     # Time full training step
     for i in range(n_iters):
         # Clear gradients from the previous step
-        optimizer.zero_grad()
-        torch.cuda.synchronize()
+        optimizer.zero_grad(set_to_none=True)
         dist.barrier()
+        torch.cuda.synchronize()
         forward_start = time.perf_counter()
         # Forward pass
         logits = ddp_model(input_batch)

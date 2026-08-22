@@ -120,8 +120,8 @@ def flash_backward_torch(Q, K, V, output, grad_out, L, is_causal):
         key_indices = torch.arange(k_start, k_end, device=K.device)
         K_tile = K[:, k_start:k_end, :]  # (B, Bk, d)
         V_tile = V[:, k_start:k_end, :]  # (B, Bk, d)
-        dK_tile = torch.zeros_like(K_tile)
-        dV_tile = torch.zeros_like(V_tile)
+        dK_tile = torch.zeros_like(K_tile, dtype=torch.float32)
+        dV_tile = torch.zeros_like(V_tile, dtype=torch.float32)
         for i in range(Tq):
             q_start = i * Bq
             q_end = min(q_start + Bq, Nq)
@@ -147,7 +147,7 @@ def flash_backward_torch(Q, K, V, output, grad_out, L, is_causal):
                 )
             P_tile = torch.exp(S_tile - torch.unsqueeze(L_tile, -1))
             dV_tile = dV_tile + torch.matmul(
-                torch.transpose(P_tile, -2, -1), grad_out_tile
+                torch.transpose(P_tile, -2, -1).to(grad_out_tile.dtype), grad_out_tile
             )
             dP_tile = torch.matmul(
                 grad_out_tile, 
@@ -155,7 +155,7 @@ def flash_backward_torch(Q, K, V, output, grad_out, L, is_causal):
             )
             dS_tile = P_tile * (dP_tile - torch.unsqueeze(D_tile, -1))
             dK_tile = dK_tile + scale * torch.matmul(
-                torch.transpose(dS_tile, -2, -1), Q_tile
+                torch.transpose(dS_tile, -2, -1).to(Q_tile.dtype), Q_tile
             )
         dK[:, k_start:k_end, :] = dK_tile
         dV[:, k_start:k_end, :] = dV_tile
@@ -167,7 +167,7 @@ def flash_backward_torch(Q, K, V, output, grad_out, L, is_causal):
         )
         Q_tile = Q[:, q_start:q_end, :]
         grad_out_tile = grad_out[:, q_start:q_end, :]
-        dQ_tile = torch.zeros_like(Q_tile)
+        dQ_tile = torch.zeros_like(Q_tile, dtype=torch.float32)
         L_tile = L[:, q_start:q_end]
         D_tile = D[:, q_start:q_end]
         for j in range(Tk):
@@ -197,7 +197,7 @@ def flash_backward_torch(Q, K, V, output, grad_out, L, is_causal):
                 torch.transpose(V_tile, -2, -1)
             )
             dS_tile = P_tile * (dP_tile - torch.unsqueeze(D_tile, -1))
-            dQ_tile = dQ_tile + torch.matmul(dS_tile, K_tile) * scale
+            dQ_tile = dQ_tile + torch.matmul(dS_tile.to(K_tile.dtype), K_tile) * scale
         dQ[:, q_start:q_end, :] = dQ_tile
     return dQ, dK, dV, None
 
@@ -269,9 +269,9 @@ def _flash_fwd(
         boundary_check=(0, 1), 
         padding_option="zero"
     )
-    output = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-    l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-    m_old = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)
+    output = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)  # FP32
+    l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)  # FP32
+    m_old = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)  # FP32
     query_start = query_tile_index * Q_TILE_SIZE
     query_end = query_start + Q_TILE_SIZE
     query_indices = query_start + tl.arange(0, Q_TILE_SIZE)
@@ -292,7 +292,7 @@ def _flash_fwd(
             boundary_check=(0, 1), 
             padding_option="zero"
         )
-        S_tile = tl.dot(Q_tile, K_tile.T) * scale
+        S_tile = tl.dot(Q_tile, K_tile.T) * scale  # FP32
         score_mask = (
             (query_indices[:, None] < N_QUERIES)
             &
@@ -308,7 +308,7 @@ def _flash_fwd(
             )
         S_tile = tl.where(score_mask, S_tile, -1e6)
         m = tl.maximum(m_old, tl.max(S_tile, axis=-1))
-        P_tile = tl.exp(S_tile - m[:, None])
+        P_tile = tl.exp(S_tile - m[:, None])  # FP32
         alpha = tl.exp(m_old - m)
         l = alpha * l + tl.sum(P_tile, axis=-1)
         output = alpha[:, None] * output + tl.dot(P_tile.to(V_tile.dtype), V_tile)
@@ -317,7 +317,7 @@ def _flash_fwd(
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
         
     output = output / l[:, None]
-    L = m_old + tl.log(l)
+    L = m_old + tl.log(l)  # FP32
     tl.store(O_block_ptr, output.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
     tl.store(L_block_ptr, L, boundary_check=(0,))
 
@@ -420,7 +420,7 @@ def _flash_bwd_dq(
         boundary_check=(0,),
         padding_option="zero"
     )
-    dQ_tile = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    dQ_tile = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)  # FP32
     query_start = query_tile_index * Q_TILE_SIZE
     query_end = query_start + Q_TILE_SIZE
     query_indices = query_start + tl.arange(0, Q_TILE_SIZE)
@@ -441,7 +441,7 @@ def _flash_bwd_dq(
             boundary_check=(0, 1), 
             padding_option="zero"
         )
-        S_tile = tl.dot(Q_tile, K_tile.T) * scale
+        S_tile = tl.dot(Q_tile, K_tile.T) * scale  # FP32
         score_mask = (
             (query_indices[:, None] < N_QUERIES)
             &
@@ -456,9 +456,9 @@ def _flash_bwd_dq(
                 )    
             )
         S_tile = tl.where(score_mask, S_tile, -1e6)
-        P_tile = tl.exp(S_tile - L_tile[:, None])
-        dP_tile = tl.dot(dO_tile, V_tile.T)
-        dS_tile = P_tile * (dP_tile - D_tile[:, None])
+        P_tile = tl.exp(S_tile - L_tile[:, None])  # FP32
+        dP_tile = tl.dot(dO_tile, V_tile.T)  # FP32
+        dS_tile = P_tile * (dP_tile - D_tile[:, None])  # FP32
         dQ_tile = dQ_tile + tl.dot(dS_tile.to(K_tile.dtype), K_tile) * scale
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
@@ -532,8 +532,8 @@ def _flash_bwd_dkdv(
         boundary_check=(0, 1), 
         padding_option="zero"
     )
-    dK_tile = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
-    dV_tile = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
+    dK_tile = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)  # FP32
+    dV_tile = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)  # FP32
     key_start = key_tile_index * K_TILE_SIZE
     key_indices = key_start + tl.arange(0, K_TILE_SIZE)
     if is_causal:
@@ -592,7 +592,7 @@ def _flash_bwd_dkdv(
             boundary_check=(0,),
             padding_option="zero"
         )
-        S_tile = tl.dot(Q_tile, K_tile.T) * scale
+        S_tile = tl.dot(Q_tile, K_tile.T) * scale  # FP32
         score_mask = (
             (query_indices[:, None] < N_QUERIES)
             &
@@ -608,9 +608,9 @@ def _flash_bwd_dkdv(
                 )    
             )
         S_tile = tl.where(score_mask, S_tile, -1e6)
-        P_tile = tl.exp(S_tile - L_tile[:, None])
-        dV_tile = dV_tile + tl.dot(P_tile.to(dO_tile.dtype).T, dO_tile)
-        dP_tile = tl.dot(dO_tile, V_tile.T)
+        P_tile = tl.exp(S_tile - L_tile[:, None])  # FP32
+        dV_tile = dV_tile + tl.dot(P_tile.to(dO_tile.dtype).T, dO_tile)  # FP32
+        dP_tile = tl.dot(dO_tile, V_tile.T)  # FP32
         dS_tile = P_tile * (dP_tile - D_tile[:, None])
         dK_tile = dK_tile + tl.dot(dS_tile.to(Q_tile.dtype).T, Q_tile) * scale
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
@@ -630,18 +630,18 @@ class FlashAttentionTriton(torch.autograd.Function):
         assert Q.device == K.device == V.device
         assert Q.dtype == K.dtype == V.dtype
 
-        output = torch.empty_like(Q)
+        output = torch.empty_like(Q)  # Q, K, V, O have the same dtype
         batch_size, n_queries, d = Q.shape
         assert d == triton.next_power_of_2(d)
         n_keys = K.shape[-2]
         Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
+        K_TILE_SIZE = 64
         Tq = math.ceil(n_queries / Q_TILE_SIZE)
         L = torch.empty(
             (batch_size, n_queries), 
             dtype=torch.float32, 
             device=Q.device
-        )
+        )  # FP32
         scale = 1 / math.sqrt(d)
         _flash_fwd[(Tq, batch_size)](
             Q, K, V,
@@ -656,7 +656,9 @@ class FlashAttentionTriton(torch.autograd.Function):
             D=d,
             Q_TILE_SIZE=Q_TILE_SIZE,
             K_TILE_SIZE=K_TILE_SIZE,
-            is_causal=is_causal
+            is_causal=is_causal,
+            num_warps=4,
+            num_stages=2,
         )
         ctx.save_for_backward(Q, K, V, output, L) 
         ctx.is_causal = is_causal
@@ -666,15 +668,15 @@ class FlashAttentionTriton(torch.autograd.Function):
     def backward(ctx, grad_out):
         Q, K, V, output, L = ctx.saved_tensors
         is_causal = ctx.is_causal
-        D = torch.sum(output.float() * grad_out.float(), dim=-1, dtype=torch.float32)
-        dQ = torch.empty_like(Q)
+        D = torch.sum(output.float() * grad_out.float(), dim=-1, dtype=torch.float32)  # FP32
+        dQ = torch.empty_like(Q)  # same dtype as Q
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
         batch_size, n_queries, d = Q.shape
         assert d == triton.next_power_of_2(d)
         n_keys = K.shape[-2]
         Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
+        K_TILE_SIZE = 64
         Tq = math.ceil(n_queries / Q_TILE_SIZE)
         scale = 1 / math.sqrt(d)
         _flash_bwd_dq[(Tq, batch_size)](
@@ -693,7 +695,9 @@ class FlashAttentionTriton(torch.autograd.Function):
             D=d,
             Q_TILE_SIZE=Q_TILE_SIZE,
             K_TILE_SIZE=K_TILE_SIZE,
-            is_causal=is_causal
+            is_causal=is_causal,
+            num_warps=4,
+            num_stages=2,
         )
 
         Tk = math.ceil(n_keys / K_TILE_SIZE)
@@ -714,7 +718,9 @@ class FlashAttentionTriton(torch.autograd.Function):
             D=d,
             Q_TILE_SIZE=Q_TILE_SIZE,
             K_TILE_SIZE=K_TILE_SIZE,
-            is_causal=is_causal
+            is_causal=is_causal,
+            num_warps=4,
+            num_stages=2,
         )
         
         return dQ, dK, dV, None

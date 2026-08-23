@@ -1,31 +1,16 @@
 from dataclasses import dataclass
-from typing import Literal
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Float, Int
 import math
 import torch
 from torch import Tensor
 import triton
 import triton.language as tl
-from einops import einsum, rearrange
 
 
-
-def materialized_lm_head_cross_entropy(
+def fused_lm_head_loss_forward_torch(
     hidden: Float[Tensor, "Nt D"],
     weight: Float[Tensor, "V D"],
     targets: Int[Tensor, "Nt"],
-) -> torch.Tensor:
-    logits = einsum(hidden, weight, "Nt D, V D -> Nt V")
-    m = logits.amax(dim=-1, keepdim=True)
-    log_sum_exp = torch.log(torch.exp(logits - m).sum(-1)) + m.squeeze(-1)  # (Nt,)
-    loss = log_sum_exp - torch.gather(logits, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-    return loss.sum()
-
-def tiled_lm_head_cross_entropy_forward(
-    hidden: Float[Tensor, "Nt D"],
-    weight: Float[Tensor, "V D"],
-    targets: Int[Tensor, "Nt"],
-    *,
     Bt: int,
     Bv: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -171,12 +156,13 @@ def fused_lm_head_loss_forward_kernel(
                 boundary_check=(0, 1),
                 padding_option="zero"
             )
-            z_tile = tl.dot(H_tile, W_tile.T, z_tile)
+            z_tile = tl.dot(H_tile, W_tile.T, z_tile, input_precision="ieee")
             H_block_ptr = H_block_ptr.advance((0, D_TILE_SIZE))
             W_block_ptr = W_block_ptr.advance((0, D_TILE_SIZE))
         w_indices = w_start + tl.arange(0, W_TILE_SIZE)
         z_mask = (w_indices < V)[None, :]
-        z_tile = tl.where(z_mask, z_tile, -float("inf")) 
+        z_tile = tl.where(z_mask, z_tile, -float("inf"))
+        z_tile = z_tile.to(H_block_ptr.type.element_ty).to(tl.float32)
         m = tl.maximum(m_old, tl.max(z_tile, axis=-1))
         l = tl.exp(m_old - m) * l + tl.sum(tl.exp(z_tile - m[:, None]), axis=-1)
         targets_z_mask = targets_tile[:, None] == w_indices[None, :]
@@ -267,13 +253,14 @@ def fused_lm_head_loss_backward_kernel(
             boundary_check=(0, 1),
             padding_option="zero"
         )
-        z_tile = tl.dot(H_tile, W_tile.T, z_tile)
+        z_tile = tl.dot(H_tile, W_tile.T, z_tile, input_precision="ieee")
         H_block_ptr = H_block_ptr.advance((0, D_TILE_SIZE))
         W_block_ptr = W_block_ptr.advance((0, D_TILE_SIZE))
     w_start = W_tile_index * W_TILE_SIZE
     w_indices = w_start + tl.arange(0, W_TILE_SIZE)
     z_mask = (w_indices < V)[None, :]
     z_tile = tl.where(z_mask, z_tile, -float("inf"))
+    z_tile = z_tile.to(H_block_ptr.type.element_ty).to(tl.float32)
     p_tile = tl.exp(z_tile - lse_tile[:, None])
     dZ_tile = dL * (p_tile - (targets_tile[:, None] == w_indices[None, :]))
     dZ_block_ptr = tl.make_block_ptr(
@@ -284,7 +271,7 @@ def fused_lm_head_loss_backward_kernel(
         block_shape=(H_TILE_SIZE, W_TILE_SIZE),
         order=(1, 0)
     )
-    tl.store(dZ_block_ptr, dZ_tile, boundary_check=(0, 1))
+    tl.store(dZ_block_ptr, dZ_tile.to(dZ_block_ptr.type.element_ty), boundary_check=(0, 1))
 
 
 class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
@@ -377,5 +364,5 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
             grad_z_tile = grad_z[:(h_end - h_start), :]
             h_tile = flat_hidden[h_start:h_end, :]
             grad_hidden[h_start:h_end, :] = torch.matmul(grad_z_tile, weight)
-            grad_weight += torch.matmul(grad_z_tile.T, h_tile)
+            grad_weight += torch.matmul(grad_z_tile.T.to(torch.float32), h_tile.to(torch.float32))
         return grad_hidden.reshape(hidden.shape), grad_weight.to(weight.dtype), None

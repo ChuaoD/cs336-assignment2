@@ -18,6 +18,8 @@ from .common import (
     _setup_process_group,
 )
 
+import torch.nn.functional as F
+from cs336_systems.model_flash import TransformerLM as FlashTransformerLM
 
 class ToyFSDPModel(nn.Module):
     """Simple model using cs336_basics Linear and Embedding for FSDP testing."""
@@ -247,3 +249,186 @@ def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
             )
 
     _cleanup_process_group()
+
+
+# Test for FSDP on Transfomer LM with Flash-attention and Fused-loss
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="Requires two CUDA GPUs",
+)
+@pytest.mark.parametrize(
+    "compute_dtype",
+    [None, torch.bfloat16],
+    ids=["fp32", "bf16"],
+)
+def test_fsdp_fused_loss_two_ranks(compute_dtype):
+    world_size = 2
+    mp.spawn(
+        _test_fsdp_fused_loss_two_ranks,
+        args=(world_size, compute_dtype),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def _test_fsdp_fused_loss_two_ranks(
+    rank: int,
+    world_size: int,
+    compute_dtype: torch.dtype | None,
+):
+    device = torch.device(
+        _setup_process_group(
+            rank=rank,
+            world_size=world_size,
+            backend="nccl",
+        )
+    )
+
+    try:
+        torch.manual_seed(42)
+
+        base_model = FlashTransformerLM(
+            vocab_size=67,
+            context_length=7,
+            num_layers=2,
+            d_model=64,
+            num_heads=4,
+            d_ff=128,
+            theta=10_000.0,
+            device=device,
+        )
+
+        reference_model = deepcopy(base_model)
+        if compute_dtype is not None:
+            _apply_mixed_precision_hooks(reference_model, compute_dtype)
+
+        fsdp_model = get_fsdp(
+            deepcopy(base_model),
+            compute_dtype=compute_dtype,
+        )
+
+        reference_optimizer = torch.optim.SGD(
+            reference_model.parameters(),
+            lr=1e-3,
+        )
+        fsdp_optimizer = torch.optim.SGD(
+            fsdp_model.parameters(),
+            lr=1e-3,
+        )
+
+        # Equal local batch sizes are important because FSDP averages gradients.
+        global_batch_size = 10
+        local_batch_size = global_batch_size // world_size
+        sequence_length = 7
+        vocab_size = 67
+
+        torch.manual_seed(123)
+        all_input_ids = torch.randint(
+            0,
+            vocab_size,
+            (global_batch_size, sequence_length),
+            device=device,
+        )
+        all_targets = torch.randint(
+            0,
+            vocab_size,
+            (global_batch_size, sequence_length),
+            device=device,
+        )
+        all_targets.reshape(-1)[0] = 0
+        all_targets.reshape(-1)[-1] = vocab_size - 1
+
+        token_positions = torch.arange(sequence_length, device=device)
+
+        start = rank * local_batch_size
+        end = start + local_batch_size
+        local_input_ids = all_input_ids[start:end]
+        local_targets = all_targets[start:end]
+
+        # Use two iterations to check weight restoration and repeated gathers.
+        for step in range(2):
+            reference_optimizer.zero_grad(set_to_none=True)
+            fsdp_optimizer.zero_grad(set_to_none=True)
+
+            # Full-batch materialized reference.
+            reference_logits = reference_model(
+                all_input_ids,
+                token_positions,
+            )
+            reference_loss_sum = F.cross_entropy(
+                reference_logits.float().reshape(-1, vocab_size),
+                all_targets.reshape(-1),
+                reduction="sum",
+            )
+            reference_loss = reference_loss_sum / all_targets.numel()
+
+            # Each rank uses its local batch and the fused-loss path.
+            local_loss_sum = fsdp_model(
+                local_input_ids,
+                token_positions,
+                targets=local_targets,
+            )
+            local_loss = local_loss_sum / local_targets.numel()
+
+            # The sum of all local fused losses should equal the global loss.
+            distributed_loss_sum = local_loss_sum.detach().clone()
+            dist.all_reduce(distributed_loss_sum, op=dist.ReduceOp.SUM)
+
+            torch.testing.assert_close(
+                distributed_loss_sum,
+                reference_loss_sum.detach(),
+                atol=1e-3 if compute_dtype is None else 5e-2,
+                rtol=1e-4 if compute_dtype is None else 5e-3,
+            )
+
+            reference_loss.backward()
+            local_loss.backward()
+            fsdp_on_after_backward(fsdp_model, fsdp_optimizer)
+
+            # Directly compare synchronized gradient shards.
+            reference_parameters = dict(reference_model.named_parameters())
+
+            for name, fsdp_parameter in fsdp_model.module.named_parameters():
+                reference_gradient = reference_parameters[name].grad
+                assert reference_gradient is not None
+                assert fsdp_parameter.grad is not None
+
+                parameter_id = id(fsdp_parameter)
+
+                if parameter_id in fsdp_model._shardable_params:
+                    metadata = fsdp_model._shardable_params[parameter_id]
+                    padded_reference_gradient = F.pad(
+                        reference_gradient.flatten(),
+                        (0, metadata["padding"]),
+                    )
+                    expected_gradient = padded_reference_gradient.chunk(
+                        world_size
+                    )[rank].reshape_as(fsdp_parameter.grad)
+                else:
+                    expected_gradient = reference_gradient
+
+                torch.testing.assert_close(
+                    fsdp_parameter.grad,
+                    expected_gradient,
+                    atol=1e-3 if compute_dtype is None else 5e-3,
+                    rtol=1e-3 if compute_dtype is None else 5e-3,
+                    msg=lambda message: (
+                        f"Step {step}, parameter {name!r}:\n{message}"
+                    ),
+                )
+
+            reference_optimizer.step()
+            fsdp_optimizer.step()
+
+            # Check complete parameters after the optimizer update.
+            full_fsdp_parameters = fsdp_gather_full_params(fsdp_model)
+
+            for name, reference_parameter in reference_model.named_parameters():
+                torch.testing.assert_close(
+                    full_fsdp_parameters[name],
+                    reference_parameter.detach(),
+                    atol=1e-4 if compute_dtype is None else 1e-3,
+                    rtol=1e-4 if compute_dtype is None else 1e-3,
+                )
+    finally:
+        _cleanup_process_group()

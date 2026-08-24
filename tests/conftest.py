@@ -183,3 +183,108 @@ def numpy_snapshot(request):
     snapshot.assert_match = patched_assert_match
 
     return snapshot
+
+@pytest.fixture
+def ts_state_dict(request):
+    import json
+
+    from .common import FIXTURES_PATH
+
+    state_dict = torch.load(FIXTURES_PATH / "ts_tests" / "model.pt", map_location="cpu")
+    config = json.load(open(FIXTURES_PATH / "ts_tests" / "model_config.json"))
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    return state_dict, config
+
+
+# Model parameters used for model fixture
+
+
+@pytest.fixture
+def n_layers():
+    return 3
+
+
+@pytest.fixture
+def vocab_size():
+    return 10_000
+
+
+@pytest.fixture
+def batch_size():
+    return 4
+
+
+@pytest.fixture
+def n_queries():
+    return 12
+
+
+@pytest.fixture
+def n_keys():
+    return 16
+
+
+@pytest.fixture
+def n_heads():
+    return 4
+
+
+@pytest.fixture
+def d_head():
+    return 16
+
+
+@pytest.fixture
+def d_model(n_heads, d_head):
+    return n_heads * d_head
+
+
+@pytest.fixture
+def d_ff():
+    return 128
+
+
+@pytest.fixture
+def q(batch_size, n_queries, d_model):
+    torch.manual_seed(1)
+    return torch.randn(batch_size, n_queries, d_model)
+
+
+@pytest.fixture
+def k(batch_size, n_keys, d_model):
+    torch.manual_seed(2)
+    return torch.randn(batch_size, n_keys, d_model)
+
+
+@pytest.fixture
+def v(batch_size, n_keys, d_model):
+    torch.manual_seed(3)
+    return torch.randn(batch_size, n_keys, d_model)
+
+
+@pytest.fixture
+def in_embeddings(batch_size, n_queries, d_model):
+    torch.manual_seed(4)
+    return torch.randn(batch_size, n_queries, d_model)
+
+
+@pytest.fixture
+def mask(batch_size, n_queries, n_keys):
+    torch.manual_seed(5)
+    return torch.randn(batch_size, n_queries, n_keys) > 0.5
+
+
+@pytest.fixture
+def in_indices(batch_size, n_queries):
+    torch.manual_seed(6)
+    return torch.randint(0, 10_000, (batch_size, n_queries))
+
+
+@pytest.fixture
+def theta():
+    return 10000.0
+
+
+@pytest.fixture
+def pos_ids(n_queries):
+    return torch.arange(0, n_queries)

@@ -293,6 +293,7 @@ def _flash_fwd(
             padding_option="zero"
         )
         S_tile = tl.dot(Q_tile, K_tile.T) * scale  # FP32
+        #S_tile = tl.dot(Q_tile, K_tile.T, input_precision="ieee") * scale  # for correctness check
         score_mask = (
             (query_indices[:, None] < N_QUERIES)
             &
@@ -312,6 +313,7 @@ def _flash_fwd(
         alpha = tl.exp(m_old - m)
         l = alpha * l + tl.sum(P_tile, axis=-1)
         output = alpha[:, None] * output + tl.dot(P_tile.to(V_tile.dtype), V_tile)
+        #output = alpha[:, None] * output + tl.dot(P_tile.to(V_tile.dtype), V_tile, input_precision="ieee")  # for correctness check
         m_old = m
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
@@ -442,6 +444,7 @@ def _flash_bwd_dq(
             padding_option="zero"
         )
         S_tile = tl.dot(Q_tile, K_tile.T) * scale  # FP32
+        #S_tile = tl.dot(Q_tile, K_tile.T, input_precision="ieee") * scale  # for correctness check
         score_mask = (
             (query_indices[:, None] < N_QUERIES)
             &
@@ -458,8 +461,10 @@ def _flash_bwd_dq(
         S_tile = tl.where(score_mask, S_tile, -1e6)
         P_tile = tl.exp(S_tile - L_tile[:, None])  # FP32
         dP_tile = tl.dot(dO_tile, V_tile.T)  # FP32
+        #dP_tile = tl.dot(dO_tile, V_tile.T, input_precision="ieee")  # for correctness check
         dS_tile = P_tile * (dP_tile - D_tile[:, None])  # FP32
         dQ_tile = dQ_tile + tl.dot(dS_tile.to(K_tile.dtype), K_tile) * scale
+        #dQ_tile = dQ_tile + tl.dot(dS_tile.to(K_tile.dtype), K_tile, input_precision="ieee") * scale  # for correctness check
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     tl.store(dQ_block_ptr, dQ_tile.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
@@ -593,6 +598,7 @@ def _flash_bwd_dkdv(
             padding_option="zero"
         )
         S_tile = tl.dot(Q_tile, K_tile.T) * scale  # FP32
+        #S_tile = tl.dot(Q_tile, K_tile.T, input_precision="ieee") * scale  # for correctness check
         score_mask = (
             (query_indices[:, None] < N_QUERIES)
             &
@@ -610,9 +616,12 @@ def _flash_bwd_dkdv(
         S_tile = tl.where(score_mask, S_tile, -1e6)
         P_tile = tl.exp(S_tile - L_tile[:, None])  # FP32
         dV_tile = dV_tile + tl.dot(P_tile.to(dO_tile.dtype).T, dO_tile)  # FP32
+        #dV_tile = dV_tile + tl.dot(P_tile.to(dO_tile.dtype).T, dO_tile, input_precision="ieee")  # for correctness check
         dP_tile = tl.dot(dO_tile, V_tile.T)  # FP32
+        #dP_tile = tl.dot(dO_tile, V_tile.T, input_precision="ieee")  # for correctness check
         dS_tile = P_tile * (dP_tile - D_tile[:, None])
         dK_tile = dK_tile + tl.dot(dS_tile.to(Q_tile.dtype).T, Q_tile) * scale
+        #dK_tile = dK_tile + tl.dot(dS_tile.to(Q_tile.dtype).T, Q_tile, input_precision="ieee") * scale  # for correctness check
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
         L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))

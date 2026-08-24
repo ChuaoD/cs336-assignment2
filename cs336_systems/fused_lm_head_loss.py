@@ -78,14 +78,15 @@ def fused_lm_head_loss_forward_kernel(
     H_ptr,
     W_ptr,
     targets_ptr,
-    token_losses_ptr,
+    partial_loss_sums_ptr,
     lse_ptr,
     stride_ht, stride_hd,
     stride_wv, stride_wd,
     stride_t,
-    stride_tl,
+    stride_pls,
     stride_lse,
     Nt,
+    Kt,
     D: tl.constexpr,
     V: tl.constexpr,
     H_TILE_SIZE: tl.constexpr,
@@ -103,12 +104,12 @@ def fused_lm_head_loss_forward_kernel(
         block_shape=(H_TILE_SIZE,),
         order=(0,)
     )
-    token_losses_block_ptr = tl.make_block_ptr(
-        token_losses_ptr,
-        shape=(Nt,),
-        strides=(stride_tl,),
-        offsets=(H_tile_index * H_TILE_SIZE,),
-        block_shape=(H_TILE_SIZE,),
+    partial_loss_sums_block_ptr = tl.make_block_ptr(
+        partial_loss_sums_ptr,
+        shape=(Kt,),
+        strides=(stride_pls,),
+        offsets=(H_tile_index,),
+        block_shape=(1,),
         order=(0,)
     )
     lse_block_ptr = tl.make_block_ptr(
@@ -170,8 +171,11 @@ def fused_lm_head_loss_forward_kernel(
         m_old = m
     lse_tile = m_old + tl.log(l)
     tl.store(lse_block_ptr, lse_tile, boundary_check=(0,))
+    token_mask = (H_tile_index * H_TILE_SIZE + tl.arange(0, H_TILE_SIZE)) < Nt
     token_loss_tile = lse_tile - targets_z_tile
-    tl.store(token_losses_block_ptr, token_loss_tile, boundary_check=(0,))
+    token_loss_tile = tl.where(token_mask, token_loss_tile, 0.0)
+    partial_loss_sum = tl.sum(token_loss_tile)
+    tl.store(partial_loss_sums_block_ptr, partial_loss_sum, boundary_check=(0,))
 
 @triton.jit
 def fused_lm_head_loss_backward_kernel(
@@ -295,24 +299,25 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
         Nt, D = flat_hidden.shape
         assert D == triton.next_power_of_2(D)
         V = weight.shape[0]
-        token_losses = torch.empty(Nt, dtype=torch.float32, device=hidden.device)
         lse = torch.empty(Nt, dtype=torch.float32, device=hidden.device)
         H_TILE_SIZE = 32
         W_TILE_SIZE = 32
         D_TILE_SIZE = 32
         Kt = math.ceil(Nt / H_TILE_SIZE)
+        partial_loss_sums = torch.empty(Kt, dtype=torch.float32, device=hidden.device)
         fused_lm_head_loss_forward_kernel[(Kt,)](
             flat_hidden,
             weight,
             flat_targets,
-            token_losses,
+            partial_loss_sums,
             lse,
             flat_hidden.stride(0), flat_hidden.stride(1),
             weight.stride(0), weight.stride(1),
             flat_targets.stride(0),
-            token_losses.stride(0),
+            partial_loss_sums.stride(0),
             lse.stride(0),
             Nt,
+            Kt,
             D,
             V,
             H_TILE_SIZE,
@@ -321,7 +326,7 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
         )
         
         ctx.save_for_backward(hidden, weight, targets, lse)
-        return token_losses.sum()
+        return partial_loss_sums.sum()
 
     @staticmethod
     def backward(ctx, grad_out):

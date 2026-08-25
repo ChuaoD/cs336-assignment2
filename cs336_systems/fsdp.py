@@ -7,6 +7,8 @@ from cs336_basics.model import Linear, Embedding
 import torch.nn.functional as F
 import torch.cuda.nvtx as nvtx
 from contextlib import nullcontext
+from dataclasses import dataclass
+from enum import Enum, auto
 
 class NaiveFSDP(nn.Module):
 
@@ -141,6 +143,29 @@ class NaiveFSDP(nn.Module):
             p.grad = grad_shard.to(torch.float32).reshape(p.data.shape)
         self._shardable_grad_sync_handles.clear()
 
+class _WeightState(Enum):
+    SHARDED = auto()
+    GATHERING = auto()
+    FULL = auto()
+
+
+@dataclass
+class _ShardMetadata:
+    param: nn.Parameter
+    full_numel: int
+    full_shape: torch.Size
+    padding: int
+    shard_size: int
+    shard_data: torch.Tensor
+    state: _WeightState = _WeightState.SHARDED
+
+
+@dataclass
+class _PendingGather:
+    handle: dist.Work
+    gathered_data: torch.Tensor
+    local_data: torch.Tensor
+
 
 class FSDP(nn.Module):
 
@@ -156,13 +181,13 @@ class FSDP(nn.Module):
         self.rank = dist.get_rank()
         self.compute_dtype = compute_dtype
         self.enable_nvtx = enable_nvtx
-        self._shardable_params = {}
+        self._shards: dict[int, _ShardMetadata] = {}
+        self._pending_gathers: dict[int, _PendingGather] = {}
         self._grad_sync_handles = []
         self._shardable_grad_sync_handles = []
         self._init_forward = True
         self._layer_order = []  # execution order of Linear or Embedding layers
         self._inspect_hook_handles = []
-        self._pending_gathers = {}
         self._param_names = {
             id(param): name
             for name, param in self.module.named_parameters()
@@ -187,14 +212,15 @@ class FSDP(nn.Module):
                     shard_size = padded_param.numel() // self.world_size
                     param_shards = padded_param.chunk(self.world_size)
                     submodule.weight.data = param_shards[self.rank].clone().to(dtype=torch.float32)
-                    self._shardable_params[param_id] = {
-                        "param": submodule.weight,
-                        "full_numel": full_numel,
-                        "full_shape": full_shape,
-                        "padding": padding,
-                        "shard_size": shard_size,
-                        "shard_data": submodule.weight.data
-                    }
+                    self._shards[param_id] = _ShardMetadata(
+                        param=submodule.weight,
+                        full_numel=full_numel,
+                        full_shape=full_shape,
+                        padding=padding,
+                        shard_size=shard_size,
+                        shard_data=submodule.weight.data,
+                        state = _WeightState.SHARDED
+                    )
                     self._inspect_hook_handles.append(submodule.register_forward_pre_hook(self._inspect_execution_order(param_id)))
                     submodule.register_forward_pre_hook(self._make_forward_pre_hook(param_id))
                     submodule.register_forward_hook(self._make_forward_post_hook(param_id))
@@ -202,7 +228,7 @@ class FSDP(nn.Module):
                     param.register_post_accumulate_grad_hook(self._make_post_grad_hook(param_id, is_shardable=True))
             for p in self.module.parameters():
                 param_id = id(p)
-                if param_id not in self._shardable_params and p.requires_grad:
+                if param_id not in self._shards and p.requires_grad:
                     p.register_post_accumulate_grad_hook(self._make_post_grad_hook(param_id, is_shardable=False))
     def _inspect_execution_order(self, param_id):
         def inspect_hook(module, args):
@@ -211,27 +237,16 @@ class FSDP(nn.Module):
     
     def _make_forward_pre_hook(self, param_id):
         def sync_weight(module, args):
-            if param_id not in self._pending_gathers:
-                self._start_gather(param_id)
-            record = self._pending_gathers[param_id]
+            self._complete_gather(param_id)
+            param = self._shards[param_id].param
             param_name = self._param_names[param_id]
-            param = self._shardable_params[param_id]["param"]
-            context = (
-                nvtx.range(f"all-gather wait: {param_name}")
-                if self.enable_nvtx and param.is_cuda
-                else nullcontext()
-            )
-            with context:
-                record["handle"].wait()
-            self._finish_gather(param_id)
-            del self._pending_gathers[param_id]
             if self.enable_nvtx and param.is_cuda:
                 nvtx.range_push(f"layer forward: {param_name}")
         return sync_weight
 
     def _make_forward_post_hook(self, param_id):
         def restore_local_shard(module, args, output):
-            param = self._shardable_params[param_id]["param"]
+            param = self._shards[param_id].param
             if self.enable_nvtx and param.is_cuda:
                 nvtx.range_pop()
             if output.requires_grad:
@@ -256,15 +271,12 @@ class FSDP(nn.Module):
 
     def _make_backward_pre_hook(self, param_id):
         def sync_weight(grad):
-            if param_id not in self._pending_gathers:
+            if self._shards[param_id].state is _WeightState.SHARDED:
                 self._start_gather(param_id)
                 if len(self._layer_order) > 1 and param_id == self._layer_order[-1]:
                     prefecth_param_id = self._layer_order[-2]
                     self._start_gather(prefecth_param_id)
-            record = self._pending_gathers[param_id]
-            record["handle"].wait()
-            self._finish_gather(param_id)
-            del self._pending_gathers[param_id]
+            self._complete_gather(param_id)
         return sync_weight
 
     def _make_post_grad_hook(self, param_id, is_shardable):
@@ -282,9 +294,9 @@ class FSDP(nn.Module):
             # Reduce-scatter shardable gradients
             if p.grad is not None:
                 self._restore_local_weight(param_id)
-                shard_metadata = self._shardable_params[param_id]
-                shard_size = shard_metadata["shard_size"]
-                padding = shard_metadata["padding"]
+                shard_metadata = self._shards[param_id]
+                shard_size = shard_metadata.shard_size
+                padding = shard_metadata.padding
                 flattened_grad = torch.flatten(p.grad)
                 padded_grad = F.pad(flattened_grad, (0, padding))
                 grad_shard = torch.empty(
@@ -320,13 +332,18 @@ class FSDP(nn.Module):
 
                 
     def _start_gather(self, param_id: int):
-        if param_id in self._pending_gathers:
+        ''' SHARDED -> GATHERING '''
+        shard_metadata = self._shards.get(param_id)
+        if shard_metadata is None or shard_metadata.state is not _WeightState.SHARDED:
             return
         compute_dtype = self.compute_dtype if self.compute_dtype is not None else torch.float32
-        shard_metadata = self._shardable_params[param_id]
-        shard_size = shard_metadata["shard_size"]
-        shard_data = shard_metadata["shard_data"]
-        gathered_param_data = torch.empty(int(shard_size * self.world_size), dtype=compute_dtype, device=shard_data.device)
+        shard_size = shard_metadata.shard_size
+        shard_data = shard_metadata.shard_data
+        gathered_data = torch.empty(
+            int(shard_size * self.world_size),
+            dtype=compute_dtype, 
+            device=shard_data.device
+        )
         local_data = shard_data.to(compute_dtype)
         param_name = self._param_names[param_id]
         context = (
@@ -335,39 +352,55 @@ class FSDP(nn.Module):
             else nullcontext()
         )
         with context:
-            handle = dist.all_gather_into_tensor(gathered_param_data, local_data, async_op=True)
-        self._pending_gathers[param_id] = {
-            "handle": handle,
-            "gathered_data": gathered_param_data,
-            "local_data": local_data
-        }
+            handle = dist.all_gather_into_tensor(
+                gathered_data, 
+                local_data, 
+                async_op=True
+            )
+        self._pending_gathers[param_id] = _PendingGather(
+            handle=handle,
+            gathered_data=gathered_data,
+            local_data=local_data
+        )
+        shard_metadata.state = _WeightState.GATHERING
 
-    def _finish_gather(self, param_id: int):
-        gathered_param_data = self._pending_gathers[param_id]["gathered_data"]
-        shard_metadata = self._shardable_params[param_id]
-        param = shard_metadata["param"]
-        full_numel = shard_metadata["full_numel"]
-        full_shape = shard_metadata["full_shape"]
-        gathered_param_data = gathered_param_data[:full_numel]
-        param.data = gathered_param_data.reshape(full_shape)
-    
-    def _gather_weight(self, param_id: int):
-        compute_dtype = self.compute_dtype if self.compute_dtype is not None else torch.float32
-        shard_metadata = self._shardable_params[param_id]
-        param = shard_metadata["param"]
-        full_numel = shard_metadata["full_numel"]
-        full_shape = shard_metadata["full_shape"]
-        shard_size = shard_metadata["shard_size"]
-        shard_data = shard_metadata["shard_data"]
-        gathered_param_data = torch.empty(int(shard_size * self.world_size), dtype=compute_dtype, device=shard_data.device)
-        dist.all_gather_into_tensor(gathered_param_data, shard_data.to(compute_dtype), async_op=False)
-        gathered_param_data = gathered_param_data[:full_numel]
-        param.data = gathered_param_data.reshape(full_shape)
+    def _complete_gather(self, param_id: int):
+        ''' SHARDED/GATHERING -> FULL '''
+        shard_metadata = self._shards[param_id]
+        if shard_metadata.state is _WeightState.FULL:
+            return
+        if shard_metadata.state is _WeightState.SHARDED:
+            self._start_gather(param_id)
+        pending = self._pending_gathers[param_id]
+        param = shard_metadata.param
+        param_name = self._param_names[param_id]
+        context = (
+            nvtx.range(f"all-gather wait: {param_name}")
+            if self.enable_nvtx and param.is_cuda
+            else nullcontext()
+        )
+        with context:
+            pending.handle.wait()
+        full_numel = shard_metadata.full_numel
+        full_shape = shard_metadata.full_shape
+        full_data = pending.gathered_data[:full_numel]
+        shard_metadata.param.data = full_data.reshape(full_shape)
+        shard_metadata.state = _WeightState.FULL
+        self._pending_gathers.pop(param_id)
+
 
     def _restore_local_weight(self, param_id: int):
-        shard_metadata = self._shardable_params[param_id]
-        param = shard_metadata["param"]
-        param.data = shard_metadata["shard_data"]
+        '''
+        FULL -> SHARDED
+        SHARDED -> no-op
+        GATHERING -> error
+        '''
+        shard_metadata = self._shards[param_id]
+        if shard_metadata.state is _WeightState.FULL:
+            shard_metadata.param.data = shard_metadata.shard_data
+            shard_metadata.state = _WeightState.SHARDED
+        elif shard_metadata.state is _WeightState.GATHERING:
+            raise RuntimeError("Cannot reshard an unconsumed gather.")
 
 
     def forward(self, *args, **kwargs):
@@ -397,4 +430,4 @@ class FSDP(nn.Module):
             h.wait()
             p.grad = grad_shard.to(torch.float32).reshape(p.data.shape)
         self._shardable_grad_sync_handles.clear()
-        
+        assert len(self._pending_gathers) == 0

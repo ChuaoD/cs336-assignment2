@@ -346,7 +346,7 @@ def _test_fsdp_fused_loss_two_ranks(
         local_targets = all_targets[start:end]
 
         # Use two iterations to check weight restoration and repeated gathers.
-        for step in range(2):
+        for step in range(3):
             reference_optimizer.zero_grad(set_to_none=True)
             fsdp_optimizer.zero_grad(set_to_none=True)
 
@@ -377,8 +377,8 @@ def _test_fsdp_fused_loss_two_ranks(
             torch.testing.assert_close(
                 distributed_loss_sum,
                 reference_loss_sum.detach(),
-                atol=1e-3 if compute_dtype is None else 5e-2,
-                rtol=1e-4 if compute_dtype is None else 5e-3,
+                atol=1e-4 if compute_dtype is None else 1e-3,
+                rtol=1e-4 if compute_dtype is None else 1e-3,
             )
 
             reference_loss.backward()
@@ -395,11 +395,11 @@ def _test_fsdp_fused_loss_two_ranks(
 
                 parameter_id = id(fsdp_parameter)
 
-                if parameter_id in fsdp_model._shardable_params:
-                    metadata = fsdp_model._shardable_params[parameter_id]
+                if parameter_id in fsdp_model._shards:
+                    metadata = fsdp_model._shards[parameter_id]
                     padded_reference_gradient = F.pad(
                         reference_gradient.flatten(),
-                        (0, metadata["padding"]),
+                        (0, metadata.padding),
                     )
                     expected_gradient = padded_reference_gradient.chunk(
                         world_size

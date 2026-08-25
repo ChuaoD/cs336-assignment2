@@ -122,16 +122,16 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
     with torch.no_grad():
         for p_name, p in fsdp_model.module.named_parameters():
             p_id = id(p)
-            if p_id in fsdp_model._shardable_params:
-                shard_metadata = fsdp_model._shardable_params[p_id]
-                full_numel = shard_metadata["full_numel"]
-                full_shape = shard_metadata["full_shape"]
-                shard_size = shard_metadata["shard_size"]
-                shard_data = shard_metadata["shard_data"]
-                gathered_param_data = torch.empty(int(shard_size * fsdp_model.world_size), dtype=shard_data.dtype, device=shard_data.device)
-                dist.all_gather_into_tensor(gathered_param_data, shard_data, async_op=False)
-                gathered_param_data = gathered_param_data[:full_numel]
-                result[p_name] = gathered_param_data.reshape(full_shape)
+            if p_id in fsdp_model._shards:
+                shard_metadata = fsdp_model._shards[p_id]
+                full_numel = shard_metadata.full_numel
+                full_shape = shard_metadata.full_shape
+                shard_size = shard_metadata.shard_size
+                shard_data = shard_metadata.shard_data
+                gathered_data = torch.empty(int(shard_size * fsdp_model.world_size), dtype=shard_data.dtype, device=shard_data.device)
+                dist.all_gather_into_tensor(gathered_data, shard_data, async_op=False)
+                gathered_data = gathered_data[:full_numel]
+                result[p_name] = gathered_data.reshape(full_shape)
             else:
                 result[p_name] = p.data.clone()
     return result

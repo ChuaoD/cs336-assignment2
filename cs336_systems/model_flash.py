@@ -10,6 +10,7 @@ from cs336_basics.model import (
 
 from cs336_systems.flash_attention import FlashAttentionTriton
 from cs336_systems.fused_lm_head_loss import FusedLMHeadCrossEntropyFunction
+from cs336_systems.activation_checkpoint import activation_checkpoint
 
 import torch
 import torch.nn as nn
@@ -107,6 +108,7 @@ class TransformerLM(nn.Module):
                  d_model: int,
                  num_heads: int,
                  d_ff: int,
+                 activation_checkpointing: bool = False,
                  theta: float | None = None,
                  device: torch.device | None = None
     ) -> None:
@@ -118,6 +120,7 @@ class TransformerLM(nn.Module):
             ) 
             for _ in range(num_layers)
         ])
+        self.activation_checkpointing = activation_checkpointing
         self.ln_final = RMSNorm(d_model, device=device)
         self.lm_head = LMHead(d_model, vocab_size, device=device)
         self.context_length = context_length
@@ -125,9 +128,25 @@ class TransformerLM(nn.Module):
     def forward(self, x: Tensor, token_positions: Tensor | None = None, targets: Tensor | None = None):
         out = self.token_embeddings(x)
         for layer in self.layers:
-            out = layer(out, token_positions)
+            if self.activation_checkpointing and self.training:
+                def run_layer(
+                    hidden: torch.Tensor,
+                    curr_layer: nn.Module = layer
+                ):
+                    return curr_layer(hidden, token_positions)
+                out = activation_checkpoint(run_layer, out)
+            else:
+                out = layer(out, token_positions)
         out= self.ln_final(out)
         return self.lm_head(out, targets)
+
+    def has_checkpointing(self):
+        return self.activation_checkpointing
+
+    def checkpoint_blocks(self):
+        if self.activation_checkpointing:
+            return self.layers
+        return None
 
 class LMHead(Linear):
     def __init__(self, 

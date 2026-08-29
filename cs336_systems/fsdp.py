@@ -9,6 +9,8 @@ import torch.cuda.nvtx as nvtx
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
+from collections.abc import Iterable
+from cs336_systems.activation_checkpoint import is_checkpoint_recomputing
 
 class NaiveFSDP(nn.Module):
 
@@ -166,6 +168,12 @@ class _PendingGather:
     gathered_data: torch.Tensor
     local_data: torch.Tensor
 
+@dataclass
+class _RecomputeExecution:
+    block_id: int
+    order: tuple[int, ...]
+    cursor: int = 0
+
 
 class FSDP(nn.Module):
 
@@ -185,13 +193,22 @@ class FSDP(nn.Module):
         self._pending_gathers: dict[int, _PendingGather] = {}
         self._grad_sync_handles = []
         self._shardable_grad_sync_handles = []
-        self._init_forward = True
+        self._init_forward = True  # indicator for initial order tracing
         self._layer_order = []  # execution order of Linear or Embedding layers
         self._inspect_hook_handles = []
         self._param_names = {
             id(param): name
             for name, param in self.module.named_parameters()
         }
+        self._has_checkpointing = self.module.has_checkpointing()
+        if self._has_checkpointing:
+            checkpoint_blocks = tuple(self.module.checkpoint_blocks)
+            self._checkpoint_block_order: dict[int, list[int]] = {}
+            for block in checkpoint_blocks:
+                block_id = id(block)
+                self._checkpoint_block_order[block_id] = []
+                block.register_forward_pre_hook(self._make_block_pre_hook(block_id))
+                block.register_forward_hook(self._make_block_post_hook(block_id))
 
         # Broadcast model parameters and buffers from rank 0 to all other ranks
         with torch.no_grad():
@@ -233,6 +250,7 @@ class FSDP(nn.Module):
     def _inspect_execution_order(self, param_id):
         def inspect_hook(module, args):
             self._layer_order.append(param_id)
+            self._checkpoint_block_order[self._curr_block_id].append(param_id)
         return inspect_hook
     
     def _make_forward_pre_hook(self, param_id):
@@ -330,7 +348,16 @@ class FSDP(nn.Module):
             
         return sync_grad_and_prefetch_weight
 
-                
+    def _make_block_pre_hook(self, block_id):
+        def enter_block(module, args):
+            if self._init_forward:
+                self._curr_block_id = block_id
+        return enter_block
+    def _make_block_post_hook(self, block_id):
+        def exit_block(module, args, output):
+            pass
+        return exit_block
+
     def _start_gather(self, param_id: int):
         ''' SHARDED -> GATHERING '''
         shard_metadata = self._shards.get(param_id)
@@ -404,6 +431,7 @@ class FSDP(nn.Module):
 
 
     def forward(self, *args, **kwargs):
+        self._curr_block_id = None
         self._forward_cursor = 0
         if not self._init_forward:
             for param_id in self._layer_order[:2]:
@@ -431,3 +459,5 @@ class FSDP(nn.Module):
             p.grad = grad_shard.to(torch.float32).reshape(p.data.shape)
         self._shardable_grad_sync_handles.clear()
         assert len(self._pending_gathers) == 0
+        for p in self._shards:
+            assert self._shards[p].state is _WeightState.SHARDED

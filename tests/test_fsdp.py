@@ -265,7 +265,27 @@ def test_fsdp_fused_loss_two_ranks(compute_dtype):
     world_size = 2
     mp.spawn(
         _test_fsdp_fused_loss_two_ranks,
-        args=(world_size, compute_dtype),
+        args=(world_size, compute_dtype, False),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="Requires two CUDA GPUs",
+)
+@pytest.mark.parametrize(
+    "compute_dtype",
+    [None, torch.bfloat16],
+    ids=["fp32", "bf16"],
+)
+def test_fsdp_checkpointed_fused_loss_two_ranks(compute_dtype):
+    """Compare checkpointed FSDP training with an uncheckpointed reference."""
+    world_size = 2
+    mp.spawn(
+        _test_fsdp_fused_loss_two_ranks,
+        args=(world_size, compute_dtype, True),
         nprocs=world_size,
         join=True,
     )
@@ -275,6 +295,7 @@ def _test_fsdp_fused_loss_two_ranks(
     rank: int,
     world_size: int,
     compute_dtype: torch.dtype | None,
+    activation_checkpointing: bool,
 ):
     device = torch.device(
         _setup_process_group(
@@ -294,11 +315,13 @@ def _test_fsdp_fused_loss_two_ranks(
             d_model=64,
             num_heads=4,
             d_ff=128,
+            activation_checkpointing=activation_checkpointing,
             theta=10_000.0,
             device=device,
         )
 
         reference_model = deepcopy(base_model)
+        reference_model.activation_checkpointing = False
         if compute_dtype is not None:
             _apply_mixed_precision_hooks(reference_model, compute_dtype)
 
@@ -311,6 +334,26 @@ def _test_fsdp_fused_loss_two_ranks(
             reference_model.parameters(),
             lr=1e-3,
         )
+
+        # A checkpointed block must run once in the original forward and once
+        # again during backward recomputation.
+        block_forward_counts = [0 for _ in fsdp_model.module.layers]
+        block_count_handles = []
+
+        if activation_checkpointing:
+            for block_index, block in enumerate(fsdp_model.module.layers):
+                def count_block_forward(
+                    module,
+                    args,
+                    output,
+                    *,
+                    index=block_index,
+                ):
+                    block_forward_counts[index] += 1
+
+                block_count_handles.append(
+                    block.register_forward_hook(count_block_forward)
+                )
         fsdp_optimizer = torch.optim.SGD(
             fsdp_model.parameters(),
             lr=1e-3,
@@ -345,7 +388,7 @@ def _test_fsdp_fused_loss_two_ranks(
         local_input_ids = all_input_ids[start:end]
         local_targets = all_targets[start:end]
 
-        # Use two iterations to check weight restoration and repeated gathers.
+        # Multiple iterations check weight restoration and repeated gathers.
         for step in range(3):
             reference_optimizer.zero_grad(set_to_none=True)
             fsdp_optimizer.zero_grad(set_to_none=True)
@@ -370,6 +413,24 @@ def _test_fsdp_fused_loss_two_ranks(
             )
             local_loss = local_loss_sum / local_targets.numel()
 
+            if activation_checkpointing:
+                # At this point only the original forward has run.
+                expected_forward_count = 2 * step + 1
+                assert block_forward_counts == [
+                    expected_forward_count
+                    for _ in block_forward_counts
+                ]
+
+                # The first forward must have recorded a non-empty local order
+                # for every checkpointed Transformer block.
+                assert len(fsdp_model._checkpoint_block_order) == len(
+                    fsdp_model.module.layers
+                )
+                assert all(
+                    len(order) > 0
+                    for order in fsdp_model._checkpoint_block_order.values()
+                )
+
             # The sum of all local fused losses should equal the global loss.
             distributed_loss_sum = local_loss_sum.detach().clone()
             dist.all_reduce(distributed_loss_sum, op=dist.ReduceOp.SUM)
@@ -384,6 +445,23 @@ def _test_fsdp_fused_loss_two_ranks(
             reference_loss.backward()
             local_loss.backward()
             fsdp_on_after_backward(fsdp_model, fsdp_optimizer)
+
+            if activation_checkpointing:
+                # Backward must have recomputed every checkpointed block once.
+                expected_forward_count = 2 * (step + 1)
+                assert block_forward_counts == [
+                    expected_forward_count
+                    for _ in block_forward_counts
+                ]
+
+            # Every execution path must finish with no active recomputation or
+            # outstanding all-gather and with all parameters resharded.
+            assert fsdp_model._recomputation is None
+            assert not fsdp_model._pending_gathers
+            assert all(
+                metadata.state.name == "SHARDED"
+                for metadata in fsdp_model._shards.values()
+            )
 
             # Directly compare synchronized gradient shards.
             reference_parameters = dict(reference_model.named_parameters())
@@ -430,5 +508,8 @@ def _test_fsdp_fused_loss_two_ranks(
                     atol=1e-4 if compute_dtype is None else 1e-3,
                     rtol=1e-4 if compute_dtype is None else 1e-3,
                 )
+
+        for handle in block_count_handles:
+            handle.remove()
     finally:
         _cleanup_process_group()

@@ -26,8 +26,8 @@ def _recomputation_context():
         yield
     finally:
         _RECOMPUTING.reset(token)
-
-
+        
+# For a custom autograd function, ordinary gradient recording is disabled inside its forward() method, and how gradients are calculated is promised to define in its own backward() method.
 class ActivationCheckpointFunction(torch.autograd.Function):
     """Recompute a callable during backward instead of saving its activations.
 

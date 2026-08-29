@@ -376,14 +376,16 @@ class FSDP(nn.Module):
         return enter_block
     def _make_block_post_hook(self, block_id):
         def exit_block(module, args, output):
-            if self._curr_block_id != block_id:
-                raise RuntimeError("Mismatched block order.")
-            self._curr_block_id = None
-            if self._recomputation is not None:
-                if self._recomputation.block_id != block_id:
-                    raise RuntimeError(" Mismatched block order.")
+            if self._init_forward:
+                assert self._curr_block_id == block_id
+                self._curr_block_id = None
+                return
+            if is_checkpoint_recomputing():
+                assert self._recomputation is not None
+                assert self._recomputation.block_id == block_id
                 assert self._recomputation.cursor == len(self._recomputation.order)
                 self._recomputation = None
+                return
         return exit_block
 
     def _start_gather(self, param_id: int):

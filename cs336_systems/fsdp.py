@@ -9,7 +9,6 @@ import torch.cuda.nvtx as nvtx
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
-from collections.abc import Iterable
 from cs336_systems.activation_checkpoint import is_checkpoint_recomputing
 
 class NaiveFSDP(nn.Module):
@@ -169,9 +168,9 @@ class _PendingGather:
     local_data: torch.Tensor
 
 @dataclass
-class _RecomputeExecution:
+class _Recomputation:
     block_id: int
-    order: tuple[int, ...]
+    order: list[int]
     cursor: int = 0
 
 
@@ -200,15 +199,18 @@ class FSDP(nn.Module):
             id(param): name
             for name, param in self.module.named_parameters()
         }
-        self._has_checkpointing = self.module.has_checkpointing()
-        if self._has_checkpointing:
-            checkpoint_blocks = tuple(self.module.checkpoint_blocks)
-            self._checkpoint_block_order: dict[int, list[int]] = {}
-            for block in checkpoint_blocks:
-                block_id = id(block)
-                self._checkpoint_block_order[block_id] = []
-                block.register_forward_pre_hook(self._make_block_pre_hook(block_id))
-                block.register_forward_hook(self._make_block_post_hook(block_id))
+        get_blocks = getattr(self.module, "checkpoint_blocks", None)
+        if callable(get_blocks):
+            checkpoint_blocks = get_blocks()
+        else:
+            checkpoint_blocks = ()
+        self._checkpoint_block_order: dict[int, list[int]] = {}
+        self._recomputation = None
+        for block in checkpoint_blocks:
+            block_id = id(block)
+            self._checkpoint_block_order[block_id] = []
+            block.register_forward_pre_hook(self._make_block_pre_hook(block_id))
+            block.register_forward_hook(self._make_block_post_hook(block_id))
 
         # Broadcast model parameters and buffers from rank 0 to all other ranks
         with torch.no_grad():
@@ -250,7 +252,8 @@ class FSDP(nn.Module):
     def _inspect_execution_order(self, param_id):
         def inspect_hook(module, args):
             self._layer_order.append(param_id)
-            self._checkpoint_block_order[self._curr_block_id].append(param_id)
+            if self._curr_block_id is not None:
+                self._checkpoint_block_order[self._curr_block_id].append(param_id)
         return inspect_hook
     
     def _make_forward_pre_hook(self, param_id):
@@ -274,6 +277,14 @@ class FSDP(nn.Module):
             self._restore_local_weight(param_id)
             if self._init_forward:
                 return 
+            if is_checkpoint_recomputing():
+                assert self._recomputation is not None
+                cursor_in_block = self._recomputation.cursor
+                order_in_block = self._recomputation.order
+                assert cursor_in_block < len(order_in_block)
+                assert param_id == order_in_block[cursor_in_block]
+                self._recomputation.cursor += 1
+                return
             current_layer_id = self._forward_cursor
             self._forward_cursor += 1
             expected_param_id = self._layer_order[current_layer_id]
@@ -350,12 +361,29 @@ class FSDP(nn.Module):
 
     def _make_block_pre_hook(self, block_id):
         def enter_block(module, args):
+            # Initial trace execution order inside the block
             if self._init_forward:
                 self._curr_block_id = block_id
+            # Recomputation
+            if not self._init_forward and is_checkpoint_recomputing():
+                assert self._recomputation is None
+                self._recomputation = _Recomputation(
+                    block_id=block_id,
+                    order=self._checkpoint_block_order[block_id],
+                    cursor=0
+                )
+
         return enter_block
     def _make_block_post_hook(self, block_id):
         def exit_block(module, args, output):
-            pass
+            if self._curr_block_id != block_id:
+                raise RuntimeError("Mismatched block order.")
+            self._curr_block_id = None
+            if self._recomputation is not None:
+                if self._recomputation.block_id != block_id:
+                    raise RuntimeError(" Mismatched block order.")
+                assert self._recomputation.cursor == len(self._recomputation.order)
+                self._recomputation = None
         return exit_block
 
     def _start_gather(self, param_id: int):

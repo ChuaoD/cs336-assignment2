@@ -140,13 +140,10 @@ class TransformerLM(nn.Module):
         out= self.ln_final(out)
         return self.lm_head(out, targets)
 
-    def has_checkpointing(self):
-        return self.activation_checkpointing
-
     def checkpoint_blocks(self):
         if self.activation_checkpointing:
-            return self.layers
-        return None
+            return tuple(self.layers)
+        return ()
 
 class LMHead(Linear):
     def __init__(self, 

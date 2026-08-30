@@ -212,7 +212,7 @@ class FSDP(nn.Module):
             block.register_forward_pre_hook(self._make_block_pre_hook(block_id))
             block.register_forward_hook(self._make_block_post_hook(block_id))
 
-        # Broadcast model parameters and buffers from rank 0 to all other ranks
+        # Broadcast rank-0 state, then replace shardable weights with shards
         with torch.no_grad():
             for param in self.module.parameters():
                 dist.broadcast(param, src=0)
@@ -221,7 +221,7 @@ class FSDP(nn.Module):
             for submodule in self.module.modules():
                 # Only shard weights of Linear and Embedding
                 if isinstance(submodule, (Linear, Embedding)):
-                    param = submodule.weight
+                    param = submodule.weight  # reference to parameter
                     param_id = id(param)
                     full_numel = param.numel()
                     full_shape = param.shape
@@ -230,7 +230,7 @@ class FSDP(nn.Module):
                     padded_param = F.pad(flattened_param, (0, padding))
                     shard_size = padded_param.numel() // self.world_size
                     param_shards = padded_param.chunk(self.world_size)
-                    submodule.weight.data = param_shards[self.rank].clone().to(dtype=torch.float32)
+                    submodule.weight.data = param_shards[self.rank].clone().to(dtype=torch.float32)  # store local parameter shard in fp32
                     self._shards[param_id] = _ShardMetadata(
                         param=submodule.weight,
                         full_numel=full_numel,
@@ -240,7 +240,7 @@ class FSDP(nn.Module):
                         shard_data=submodule.weight.data,
                         state = _WeightState.SHARDED
                     )
-                    self._inspect_hook_handles.append(submodule.register_forward_pre_hook(self._inspect_execution_order(param_id)))
+                    self._inspect_hook_handles.append(submodule.register_forward_pre_hook(self._inspect_execution_order(param_id)))  # for order tracing
                     submodule.register_forward_pre_hook(self._make_forward_pre_hook(param_id))
                     submodule.register_forward_hook(self._make_forward_post_hook(param_id))
                     # Assume all sharded weights are trainable
@@ -249,6 +249,7 @@ class FSDP(nn.Module):
                 param_id = id(p)
                 if param_id not in self._shards and p.requires_grad:
                     p.register_post_accumulate_grad_hook(self._make_post_grad_hook(param_id, is_shardable=False))
+
     def _inspect_execution_order(self, param_id):
         def inspect_hook(module, args):
             self._layer_order.append(param_id)
@@ -300,11 +301,6 @@ class FSDP(nn.Module):
 
     def _make_backward_pre_hook(self, param_id):
         def sync_weight(grad):
-            if self._shards[param_id].state is _WeightState.SHARDED:
-                self._start_gather(param_id)
-                if len(self._layer_order) > 1 and param_id == self._layer_order[-1]:
-                    prefecth_param_id = self._layer_order[-2]
-                    self._start_gather(prefecth_param_id)
             self._complete_gather(param_id)
         return sync_weight
 

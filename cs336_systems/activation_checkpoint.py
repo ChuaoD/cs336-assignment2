@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 import torch
+import torch.cuda.nvtx as nvtx
+from contextlib import nullcontext
 
 
 _RECOMPUTING: ContextVar[bool] = ContextVar(
@@ -26,7 +28,7 @@ def _recomputation_context():
         yield
     finally:
         _RECOMPUTING.reset(token)
-        
+
 # For a custom autograd function, ordinary gradient recording is disabled inside its forward() method, and how gradients are calculated is promised to define in its own backward() method.
 class ActivationCheckpointFunction(torch.autograd.Function):
     """Recompute a callable during backward instead of saving its activations.
@@ -86,9 +88,15 @@ class ActivationCheckpointFunction(torch.autograd.Function):
             if input_requires_grad[i]:
                 detached_input.requires_grad_()
             recomputation_input.append(detached_input)
+        nvtx_context = (
+            nvtx.range(f"activation checkpoint recomputation")
+            if saved_input[0].is_cuda
+            else nullcontext()
+        )
         with torch.enable_grad():
-            with _recomputation_context():
-                recomputed_output = run_function(*recomputation_input)
+            with nvtx_context:
+                with _recomputation_context():
+                    recomputed_output = run_function(*recomputation_input)
         recomputed_output.backward(gradient=grad_output)
         input_grads = tuple(i.grad if i.requires_grad else None for i in recomputation_input)
         return None, *input_grads

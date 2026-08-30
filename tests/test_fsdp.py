@@ -311,7 +311,7 @@ def _test_fsdp_fused_loss_two_ranks(
         base_model = FlashTransformerLM(
             vocab_size=67,
             context_length=7,
-            num_layers=2,
+            num_layers=4,
             d_model=64,
             num_heads=4,
             d_ff=128,
@@ -335,12 +335,23 @@ def _test_fsdp_fused_loss_two_ranks(
             lr=1e-3,
         )
 
-        # A checkpointed block must run once in the original forward and once
-        # again during backward recomputation.
+        # Count every block invocation. The expected count is derived from the
+        # model's checkpoint_blocks() policy, so this remains valid if that
+        # policy changes.
         block_forward_counts = [0 for _ in fsdp_model.module.layers]
         block_count_handles = []
 
         if activation_checkpointing:
+            checkpointed_blocks = tuple(
+                fsdp_model.module.checkpoint_blocks()
+            )
+            checkpointed_block_ids = {
+                id(block) for block in checkpointed_blocks
+            }
+            assert checkpointed_blocks, (
+                "The checkpointed test must exercise at least one block."
+            )
+
             for block_index, block in enumerate(fsdp_model.module.layers):
                 def count_block_forward(
                     module,
@@ -414,17 +425,21 @@ def _test_fsdp_fused_loss_two_ranks(
             local_loss = local_loss_sum / local_targets.numel()
 
             if activation_checkpointing:
-                # At this point only the original forward has run.
-                expected_forward_count = 2 * step + 1
-                assert block_forward_counts == [
-                    expected_forward_count
-                    for _ in block_forward_counts
+                # Every block has completed this step's original forward.
+                # Checkpointed blocks were also recomputed once in each prior
+                # completed step; ordinary blocks were not.
+                expected_forward_counts = [
+                    2 * step + 1
+                    if id(block) in checkpointed_block_ids
+                    else step + 1
+                    for block in fsdp_model.module.layers
                 ]
+                assert block_forward_counts == expected_forward_counts
 
                 # The first forward must have recorded a non-empty local order
-                # for every checkpointed Transformer block.
-                assert len(fsdp_model._checkpoint_block_order) == len(
-                    fsdp_model.module.layers
+                # for exactly the blocks selected by the model's policy.
+                assert set(fsdp_model._checkpoint_block_order) == (
+                    checkpointed_block_ids
                 )
                 assert all(
                     len(order) > 0
@@ -447,12 +462,16 @@ def _test_fsdp_fused_loss_two_ranks(
             fsdp_on_after_backward(fsdp_model, fsdp_optimizer)
 
             if activation_checkpointing:
-                # Backward must have recomputed every checkpointed block once.
-                expected_forward_count = 2 * (step + 1)
-                assert block_forward_counts == [
-                    expected_forward_count
-                    for _ in block_forward_counts
+                # Backward replays each selected block exactly once. Blocks not
+                # selected by the policy still run only in the original
+                # forward.
+                expected_forward_counts = [
+                    2 * (step + 1)
+                    if id(block) in checkpointed_block_ids
+                    else step + 1
+                    for block in fsdp_model.module.layers
                 ]
+                assert block_forward_counts == expected_forward_counts
 
             # Every execution path must finish with no active recomputation or
             # outstanding all-gather and with all parameters resharded.

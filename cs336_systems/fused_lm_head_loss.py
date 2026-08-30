@@ -300,8 +300,8 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
         assert D == triton.next_power_of_2(D)
         V = weight.shape[0]
         lse = torch.empty(Nt, dtype=torch.float32, device=hidden.device)
-        H_TILE_SIZE = 32
-        W_TILE_SIZE = 32
+        H_TILE_SIZE = 256
+        W_TILE_SIZE = 64
         D_TILE_SIZE = 32
         Kt = math.ceil(Nt / H_TILE_SIZE)
         partial_loss_sums = torch.empty(Kt, dtype=torch.float32, device=hidden.device)

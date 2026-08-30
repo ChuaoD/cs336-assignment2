@@ -284,6 +284,8 @@ class FSDP(nn.Module):
                 order_in_block = self._recomputation.order
                 assert cursor_in_block < len(order_in_block)
                 assert param_id == order_in_block[cursor_in_block]
+                if cursor_in_block < len(order_in_block) - 2:
+                    self._start_gather(order_in_block[cursor_in_block + 2])
                 self._recomputation.cursor += 1
                 return
             current_layer_id = self._forward_cursor
@@ -360,6 +362,7 @@ class FSDP(nn.Module):
             # Initial trace execution order inside the block
             if self._init_forward:
                 self._curr_block_id = block_id
+                return
             # Recomputation
             if not self._init_forward and is_checkpoint_recomputing():
                 assert self._recomputation is None
@@ -368,6 +371,9 @@ class FSDP(nn.Module):
                     order=self._checkpoint_block_order[block_id],
                     cursor=0
                 )
+                self._start_gather(self._recomputation.order[0])
+                if len(self._recomputation.order) > 1:
+                    self._start_gather(self._recomputation.order[1])
 
         return enter_block
     def _make_block_post_hook(self, block_id):
@@ -380,6 +386,7 @@ class FSDP(nn.Module):
                 assert self._recomputation is not None
                 assert self._recomputation.block_id == block_id
                 assert self._recomputation.cursor == len(self._recomputation.order)
+                assert all(self._shards[p].state is _WeightState.SHARDED for p in self._recomputation.order)
                 self._recomputation = None
                 return
         return exit_block

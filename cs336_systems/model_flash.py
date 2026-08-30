@@ -127,8 +127,8 @@ class TransformerLM(nn.Module):
 
     def forward(self, x: Tensor, token_positions: Tensor | None = None, targets: Tensor | None = None):
         out = self.token_embeddings(x)
-        for layer in self.layers:
-            if self.activation_checkpointing and self.training:
+        for i, layer in enumerate(self.layers):
+            if self.activation_checkpointing and self.training and i % 4 != 3:
                 def run_layer(
                     hidden: torch.Tensor,
                     curr_layer: nn.Module = layer
@@ -142,7 +142,11 @@ class TransformerLM(nn.Module):
 
     def checkpoint_blocks(self):
         if self.activation_checkpointing:
-            return tuple(self.layers)
+            return tuple(
+                layer
+                for i, layer in enumerate(self.layers)
+                if self.activation_checkpointing and i % 4 != 3
+            )
         return ()
 
 class LMHead(Linear):

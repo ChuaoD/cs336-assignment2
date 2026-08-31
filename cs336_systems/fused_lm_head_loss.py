@@ -301,7 +301,7 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
         V = weight.shape[0]
         lse = torch.empty(Nt, dtype=torch.float32, device=hidden.device)
         H_TILE_SIZE = 256
-        W_TILE_SIZE = 64
+        W_TILE_SIZE = 32
         D_TILE_SIZE = 32
         Kt = math.ceil(Nt / H_TILE_SIZE)
         partial_loss_sums = torch.empty(Kt, dtype=torch.float32, device=hidden.device)
@@ -335,7 +335,7 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
         flat_targets = targets.reshape(-1)
         Nt, D = flat_hidden.shape
         V = weight.shape[0]
-        H_TILE_SIZE = 32
+        H_TILE_SIZE = 256
         W_TILE_SIZE = 32
         D_TILE_SIZE = 32
         grad_hidden = torch.empty_like(flat_hidden)
@@ -369,5 +369,10 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
             grad_z_tile = grad_z[:(h_end - h_start), :]
             h_tile = flat_hidden[h_start:h_end, :]
             grad_hidden[h_start:h_end, :] = torch.matmul(grad_z_tile, weight)
-            grad_weight += torch.matmul(grad_z_tile.T.to(torch.float32), h_tile.to(torch.float32))
+            grad_weight.addmm_(
+                grad_z_tile.T.to(torch.float32),
+                h_tile.to(torch.float32),
+                beta=1.0,
+                alpha=1.0,
+            )
         return grad_hidden.reshape(hidden.shape), grad_weight.to(weight.dtype), None

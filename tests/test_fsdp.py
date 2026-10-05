@@ -19,6 +19,8 @@ from .common import (
 )
 
 import torch.nn.functional as F
+from cs336_basics.optimizer import AdamW as ReferenceAdamW
+from cs336_systems.fused_adamw import FusedAdamW
 from cs336_systems.model_flash import TransformerLM as FlashTransformerLM
 
 class ToyFSDPModel(nn.Module):
@@ -249,6 +251,220 @@ def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
             )
 
     _cleanup_process_group()
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="Requires two CUDA GPUs",
+)
+@pytest.mark.parametrize(
+    "compute_dtype",
+    [None, torch.bfloat16],
+    ids=["fp32", "bf16"],
+)
+def test_fsdp_fused_adamw_two_ranks(compute_dtype):
+    """Match full-model AdamW using FSDP shards and fused AdamW."""
+    world_size = 2
+    mp.spawn(
+        _test_fsdp_fused_adamw_two_ranks,
+        args=(world_size, compute_dtype),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def _test_fsdp_fused_adamw_two_ranks(
+    rank: int,
+    world_size: int,
+    compute_dtype: torch.dtype | None,
+):
+    device = torch.device(
+        _setup_process_group(
+            rank=rank,
+            world_size=world_size,
+            backend="nccl",
+        )
+    )
+
+    try:
+        torch.manual_seed(42)
+
+        # Odd dimensions exercise FSDP's shard-padding path.
+        base_model = ToyFSDPModel(
+            vocab_size=101,
+            d_model=63,
+            d_ff=127,
+        ).to(device)
+
+        reference_model = deepcopy(base_model)
+        if compute_dtype is not None:
+            _apply_mixed_precision_hooks(reference_model, compute_dtype)
+
+        fsdp_model = get_fsdp(
+            deepcopy(base_model),
+            compute_dtype=compute_dtype,
+        )
+
+        optimizer_kwargs = {
+            "lr": 3e-4,
+            "betas": (0.85, 0.97),
+            "eps": 1e-6,
+            "weight_decay": 0.03,
+        }
+        reference_optimizer = ReferenceAdamW(
+            reference_model.parameters(),
+            **optimizer_kwargs,
+        )
+        fsdp_optimizer = FusedAdamW(
+            fsdp_model.parameters(),
+            block_size=256,
+            **optimizer_kwargs,
+        )
+
+        generator = torch.Generator(device=device).manual_seed(123)
+        batch_size = 8
+        sequence_length = 5
+        input_ids = torch.randint(
+            0,
+            101,
+            (batch_size, sequence_length),
+            device=device,
+            generator=generator,
+        )
+        labels = torch.randint(
+            0,
+            101,
+            (batch_size,),
+            device=device,
+            generator=generator,
+        )
+        local_batch_size = batch_size // world_size
+        local_slice = slice(
+            rank * local_batch_size,
+            (rank + 1) * local_batch_size,
+        )
+
+        parameter_atol = 2e-5 if compute_dtype is None else 2e-3
+        gradient_atol = 2e-4 if compute_dtype is None else 5e-3
+        state_atol = 2e-5 if compute_dtype is None else 5e-3
+
+        for step in range(3):
+            reference_optimizer.zero_grad(set_to_none=True)
+            fsdp_optimizer.zero_grad(set_to_none=True)
+
+            reference_logits = reference_model(input_ids)
+            reference_loss = F.cross_entropy(
+                reference_logits[:, -1, :].float(),
+                labels,
+            )
+            reference_loss.backward()
+
+            local_logits = fsdp_model(input_ids[local_slice])
+            local_loss = F.cross_entropy(
+                local_logits[:, -1, :].float(),
+                labels[local_slice],
+            )
+            local_loss.backward()
+            fsdp_on_after_backward(fsdp_model, fsdp_optimizer)
+
+            # Equal local batch sizes make the average of local mean losses
+            # identical to the full-batch reference mean.
+            distributed_loss = local_loss.detach().clone()
+            dist.all_reduce(distributed_loss, op=dist.ReduceOp.AVG)
+            torch.testing.assert_close(
+                distributed_loss,
+                reference_loss.detach(),
+                atol=1e-5 if compute_dtype is None else 2e-3,
+                rtol=1e-5 if compute_dtype is None else 2e-3,
+            )
+
+            reference_parameters = dict(reference_model.named_parameters())
+
+            # Check that FSDP produced the gradient shard that fused AdamW is
+            # about to consume.
+            for name, fsdp_parameter in fsdp_model.module.named_parameters():
+                reference_gradient = reference_parameters[name].grad
+                assert reference_gradient is not None
+                assert fsdp_parameter.grad is not None
+
+                metadata = fsdp_model._shards.get(id(fsdp_parameter))
+                if metadata is None:
+                    expected_gradient = reference_gradient
+                else:
+                    expected_gradient = F.pad(
+                        reference_gradient.flatten(),
+                        (0, metadata.padding),
+                    ).chunk(world_size)[rank].reshape_as(fsdp_parameter.grad)
+
+                torch.testing.assert_close(
+                    fsdp_parameter.grad,
+                    expected_gradient,
+                    atol=gradient_atol,
+                    rtol=gradient_atol,
+                    msg=lambda message: (
+                        f"Step {step}, gradient {name!r}:\n{message}"
+                    ),
+                )
+
+            reference_optimizer.step()
+            fsdp_optimizer.step()
+
+            # Compare complete parameters after each optimizer step.
+            full_fsdp_parameters = fsdp_gather_full_params(fsdp_model)
+            for name, reference_parameter in reference_parameters.items():
+                torch.testing.assert_close(
+                    full_fsdp_parameters[name],
+                    reference_parameter.detach(),
+                    atol=parameter_atol,
+                    rtol=parameter_atol,
+                    msg=lambda message: (
+                        f"Step {step}, parameter {name!r}:\n{message}"
+                    ),
+                )
+
+            # Fused optimizer moments live beside each local parameter shard.
+            # Compare them with the corresponding slice of the reference
+            # optimizer's full moment tensors.
+            for name, fsdp_parameter in fsdp_model.module.named_parameters():
+                reference_parameter = reference_parameters[name]
+                reference_state = reference_optimizer.state[reference_parameter]
+                fsdp_state = fsdp_optimizer.state[fsdp_parameter]
+
+                assert fsdp_state["t"] == reference_state["t"] == step + 2
+                for state_name in ("m", "v"):
+                    reference_moment = reference_state[state_name]
+                    metadata = fsdp_model._shards.get(id(fsdp_parameter))
+                    if metadata is None:
+                        expected_moment = reference_moment
+                    else:
+                        expected_moment = F.pad(
+                            reference_moment.flatten(),
+                            (0, metadata.padding),
+                        ).chunk(world_size)[rank].reshape_as(
+                            fsdp_state[state_name]
+                        )
+
+                    assert fsdp_state[state_name].dtype == torch.float32
+                    assert fsdp_state[state_name].device == device
+                    assert fsdp_state[state_name].shape == fsdp_parameter.shape
+                    torch.testing.assert_close(
+                        fsdp_state[state_name],
+                        expected_moment,
+                        atol=state_atol,
+                        rtol=state_atol,
+                        msg=lambda message: (
+                            f"Step {step}, optimizer state "
+                            f"{name!r}.{state_name}:\n{message}"
+                        ),
+                    )
+
+            assert not fsdp_model._pending_gathers
+            assert all(
+                metadata.state.name == "SHARDED"
+                for metadata in fsdp_model._shards.values()
+            )
+    finally:
+        _cleanup_process_group()
 
 
 # Test for FSDP on Transfomer LM with Flash-attention and Fused-loss

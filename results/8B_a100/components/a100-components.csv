@@ -1,0 +1,23 @@
+component,implementation,mode,time_ms,model_flops,min_bytes
+attention core,triton flash attention (project),forward,61.509115346272786,8796093022208,
+attention core,triton flash attention (project),forward+backward,245.2385711669922,26388279066624,
+attention core,"pytorch sdpa, flash backend",forward,42.37254233982252,8796093022208,
+attention core,"pytorch sdpa, flash backend",forward+backward,157.74415334065756,26388279066624,
+q/k/v/output projection,cs336_basics Linear (einsum),forward,3.9096653684656673,1099511627776,
+q/k/v/output projection,cs336_basics Linear (einsum),forward+backward,11.801821272057223,3298534883328,
+swiglu w1/w3,cs336_basics Linear (einsum),forward,10.54060113028194,2954937499648,
+swiglu w1/w3,cs336_basics Linear (einsum),forward+backward,31.15668438326928,8864812498944,
+swiglu w2,cs336_basics Linear (einsum),forward,10.301774342854818,2954937499648,
+swiglu w2,cs336_basics Linear (einsum),forward+backward,31.28742193406628,8864812498944,
+rmsnorm,cs336_basics RMSNorm,forward,3.4609544406766477,,536870912
+rmsnorm,cs336_basics RMSNorm,forward+backward,13.630996929274666,,
+rope,cs336_basics RotaryPositionalEmbedding,forward,4.574841451644898,,536870912
+rope,cs336_basics RotaryPositionalEmbedding,forward+backward,16.977596578926875,,
+swiglu gate,cs336_basics silu(w1 x) * w3 x,forward,3.2932104775134254,,2164260864
+swiglu gate,cs336_basics silu(w1 x) * w3 x,forward+backward,10.528602887225407,,
+lm head + loss,fused triton (project),forward,1233.1905517578125,40785009442816,
+lm head + loss,fused triton (project),forward+backward,2188.991943359375,122355028328448,
+lm head + loss,einsum logits + F.cross_entropy,forward,167.91661682128907,40785009442816,
+lm head + loss,einsum logits + F.cross_entropy,forward+backward,493.78919982910156,122355028328448,
+optimizer,fused adamw (project),step,34.9261360168457,,56885821440
+optimizer,adamw (assignment 1),step,163.92227935791016,,56885821440

@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 
 from cs336_basics.optimizer import AdamW
 from cs336_systems.fsdp import FSDP
+from cs336_systems.fused_adamw import FusedAdamW
 from cs336_systems.model_flash import TransformerLM
 
 
@@ -26,6 +27,7 @@ class BenchmarkConfig:
     num_heads: int
     warmup_steps: int
     measured_steps: int
+    optimizer: str
     activation_checkpointing: bool
 
 
@@ -82,7 +84,8 @@ def benchmark_worker(rank: int, config: BenchmarkConfig) -> None:
             device=device,
         )
         fsdp_model = FSDP(model, compute_dtype=torch.bfloat16)
-        optimizer = AdamW(fsdp_model.parameters())
+        optimizer_cls = FusedAdamW if config.optimizer == "fused-adamw" else AdamW
+        optimizer = optimizer_cls(fsdp_model.parameters())
         fsdp_model.train()
 
         def train_step() -> torch.Tensor:
@@ -141,6 +144,7 @@ def benchmark_worker(rank: int, config: BenchmarkConfig) -> None:
             gib = 1024**3
 
             print(f"world_size={config.world_size}")
+            print(f"optimizer={optimizer_cls.__module__}.{optimizer_cls.__name__}")
             print(f"global_batch_size={config.global_batch_size}")
             print(f"local_batch_size={local_batch_size}")
             print(f"context_length={config.context_length}")
@@ -174,6 +178,9 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--measured-steps", type=int, default=3)
     parser.add_argument(
+        "--optimizer", choices=["adamw", "fused-adamw"], default="fused-adamw"
+    )
+    parser.add_argument(
         "--activation-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -190,6 +197,7 @@ def parse_args() -> BenchmarkConfig:
         num_heads=args.num_heads,
         warmup_steps=args.warmup_steps,
         measured_steps=args.measured_steps,
+        optimizer=args.optimizer,
         activation_checkpointing=args.activation_checkpointing,
     )
 

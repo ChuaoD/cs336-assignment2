@@ -1,0 +1,44 @@
+device=NVIDIA A100-SXM4-80GB
+reference_gpu=NVIDIA A100 80GB SXM
+peak_bf16_tflops=312.0
+memory_bandwidth_gb_per_s=2039
+context_length=32768
+d_model=4096
+d_ff=11008
+num_heads=32
+vocab_size=151936
+optimizer_world_size=4
+
+component                 implementation                          mode                  time_ms   TFLOP/s   %peak     GB/s    %bw
+---------------------------------------------------------------------------------------------------------------------------------
+attention core            triton flash attention (project)        forward                61.584     142.8   45.8%
+attention core            triton flash attention (project)        forward+backward      245.365     107.5   34.5%
+attention core            pytorch sdpa, flash backend             forward                42.807     205.5   65.9%
+attention core            pytorch sdpa, flash backend             forward+backward      159.062     165.9   53.2%
+q/k/v/output projection   cs336_basics Linear (einsum)            forward                 3.992     275.5   88.3%
+q/k/v/output projection   cs336_basics Linear (einsum)            forward+backward       12.051     273.7   87.7%
+swiglu w1/w3              cs336_basics Linear (einsum)            forward                10.742     275.1   88.2%
+swiglu w1/w3              cs336_basics Linear (einsum)            forward+backward       31.759     279.1   89.5%
+swiglu w2                 cs336_basics Linear (einsum)            forward                10.505     281.3   90.2%
+swiglu w2                 cs336_basics Linear (einsum)            forward+backward       31.865     278.2   89.2%
+rmsnorm                   cs336_basics RMSNorm                    forward                 3.463                        155   7.6%
+rmsnorm                   cs336_basics RMSNorm                    forward+backward       13.636
+rope                      cs336_basics RotaryPositionalEmbedding  forward                 4.582                        117   5.7%
+rope                      cs336_basics RotaryPositionalEmbedding  forward+backward       16.992
+swiglu gate               cs336_basics silu(w1 x) * w3 x          forward                 3.275                        661  32.4%
+swiglu gate               cs336_basics silu(w1 x) * w3 x          forward+backward       10.529
+lm head + loss            fused triton (project)                  forward              1238.378      32.9   10.6%
+lm head + loss            fused triton (project)                  forward+backward     3863.775      31.7   10.1%
+lm head + loss            einsum logits + F.cross_entropy         forward               170.611     239.1   76.6%
+lm head + loss            einsum logits + F.cross_entropy         forward+backward      502.113     243.7   78.1%
+optimizer                 fused adamw (project)                   step                   34.808                       1634  80.1%
+optimizer                 adamw (assignment 1)                    step                  164.368                        346  17.0%
+
+34 blocks, forward + backward                    15665.0 ms    66.1%
+32 recomputed block forwards                      4124.9 ms    17.4%
+final rmsnorm, forward + backward                   13.6 ms     0.1%
+lm head + loss, forward + backward                3863.8 ms    16.3%
+optimizer step (fused-adamw)                        34.8 ms     0.1%
+component compute budget                         23702.2 ms
+measured step time                               24108.0 ms
+outside the timed components                       405.8 ms     1.7% of step

@@ -128,7 +128,7 @@ class TransformerLM(nn.Module):
     def forward(self, x: Tensor, token_positions: Tensor | None = None, targets: Tensor | None = None):
         out = self.token_embeddings(x)
         for i, layer in enumerate(self.layers):
-            if self.activation_checkpointing and self.training and i % 4 != 3:
+            if self.activation_checkpointing and self.training and i % 16 != 15:
                 def run_layer(
                     hidden: torch.Tensor,
                     curr_layer: nn.Module = layer
@@ -145,7 +145,7 @@ class TransformerLM(nn.Module):
             return tuple(
                 layer
                 for i, layer in enumerate(self.layers)
-                if self.activation_checkpointing and i % 4 != 3
+                if self.activation_checkpointing and i % 16 != 15
             )
         return ()
 

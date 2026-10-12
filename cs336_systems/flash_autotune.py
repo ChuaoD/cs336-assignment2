@@ -1,3 +1,4 @@
+import itertools
 import math
 import torch
 import triton
@@ -5,31 +6,39 @@ import triton.language as tl
 from pathlib import Path
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-@triton.autotune(
-    configs=[
+
+
+def make_configs(tile_sizes, num_warps=(4, 8), num_stages=(2, 3)):
+    """Every combination of (Q_TILE_SIZE, K_TILE_SIZE), num_warps, and num_stages.
+
+    Configs that need more shared memory than the GPU has fail to compile;
+    the autotuner records them as infinitely slow and moves on.
+    """
+    return [
         triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64},
-            num_warps=8,
-            num_stages=2,
-        ),
-    ],
-    key=["N_QUERIES", "N_KEYS", "D", "is_causal"],
+            {"Q_TILE_SIZE": q_tile, "K_TILE_SIZE": k_tile},
+            num_warps=warps,
+            num_stages=stages,
+        )
+        for (q_tile, k_tile), warps, stages in itertools.product(
+            tile_sizes, num_warps, num_stages
+        )
+    ]
+
+
+# Each search includes (32, 64) with four warps and two stages, the config
+# flash_attention.py uses today, as the baseline. The forward and dQ kernels
+# keep a Q tile resident and stream K/V tiles past it, so they favor large Q
+# tiles; the dK/dV kernel keeps a K/V tile resident and streams Q tiles.
+FWD_CONFIGS = make_configs(
+    [(32, 64), (64, 32), (64, 64), (64, 128), (128, 32), (128, 64), (128, 128)],
+    num_stages=(2, 3, 4),
 )
+DQ_CONFIGS = make_configs([(32, 64), (64, 32), (64, 64), (128, 32), (128, 64)])
+DKDV_CONFIGS = make_configs([(32, 64), (64, 64), (32, 128), (64, 128)])
+AUTOTUNE_KEY = ["N_QUERIES", "N_KEYS", "D", "is_causal"]
+
+@triton.autotune(configs=FWD_CONFIGS, key=AUTOTUNE_KEY)
 @triton.jit
 def _flash_fwd(
     Q_ptr, K_ptr, V_ptr,
@@ -149,32 +158,7 @@ def _flash_fwd(
     tl.store(O_block_ptr, output.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
     tl.store(L_block_ptr, L, boundary_check=(0,))
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64},
-            num_warps=8,
-            num_stages=2,
-        ),
-    ],
-    key=["N_QUERIES", "N_KEYS", "D", "is_causal"],
-)
+@triton.autotune(configs=DQ_CONFIGS, key=AUTOTUNE_KEY)
 @triton.jit
 def _flash_bwd_dq(
     Q_ptr, K_ptr, V_ptr,
@@ -318,32 +302,7 @@ def _flash_bwd_dq(
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     tl.store(dQ_block_ptr, dQ_tile.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64},
-            num_warps=8,
-            num_stages=2,
-        ),
-    ],
-    key=["N_QUERIES", "N_KEYS", "D", "is_causal"],
-)
+@triton.autotune(configs=DKDV_CONFIGS, key=AUTOTUNE_KEY)
 @triton.jit
 def _flash_bwd_dkdv(
     Q_ptr, K_ptr, V_ptr,
@@ -582,7 +541,7 @@ class FlashAttentionTriton(torch.autograd.Function):
 
         # Tk = math.ceil(n_keys / K_TILE_SIZE)
         grid = lambda meta: (
-            triton.cdiv(n_queries, meta["K_TILE_SIZE"]), 
+            triton.cdiv(n_keys, meta["K_TILE_SIZE"]), 
             batch_size
         )
         _flash_bwd_dkdv[grid](
@@ -607,14 +566,36 @@ class FlashAttentionTriton(torch.autograd.Function):
     
 flash_triton = FlashAttentionTriton.apply
 
-BATCH = 1
+BATCH = 32
 is_causal = True
 D = 128
-mode = "fwd"
 SEQ_LEN = 32768
 dtype = torch.bfloat16
 
                      
+def print_autotuning_results(kernel, name, flops):
+    """Print every config's median time, fastest first."""
+    timings = getattr(kernel, "configs_timings", None)
+    if timings is None:
+        # Older Triton releases keep only the winner.
+        print(f"== {name}: best config {kernel.best_config} ==")
+        return
+    rows = []
+    for config, timing in timings.items():
+        # The autotuner stores [median, 20th, 80th percentile] in milliseconds.
+        ms = timing[0] if isinstance(timing, (list, tuple)) else timing
+        rows.append((ms, config))
+    print(f"== {name}: {len(rows)} configs ==")
+    for ms, config in sorted(rows, key=lambda row: row[0]):
+        tiles = f"Q={config.kwargs['Q_TILE_SIZE']:>3} K={config.kwargs['K_TILE_SIZE']:>3}"
+        launch = f"warps={config.num_warps} stages={config.num_stages}"
+        if math.isinf(ms):
+            print(f"  {tiles}  {launch}  skipped (does not fit)")
+        else:
+            tflops = flops / (ms / 1_000) / 1e12
+            print(f"  {tiles}  {launch}  {ms:9.3f} ms  {tflops:6.1f} TFLOP/s")
+
+
 def main():
     
     Q = torch.randn(
@@ -629,6 +610,14 @@ def main():
     output = FlashAttentionTriton.apply(Q, K, V, is_causal)
     grad_output = torch.randn_like(output)
     output.backward(grad_output)
+    torch.cuda.synchronize()
+
+    # One causal [N, N] x [N, D] product per batch entry; the mask removes half.
+    causal_matmul_flops = BATCH * SEQ_LEN**2 * D
+    # Forward: QK^T, PV. dQ: QK^T, dO V^T, dS K. dK/dV: QK^T, P^T dO, dO V^T, dS^T Q.
+    print_autotuning_results(_flash_fwd, "forward", 2 * causal_matmul_flops)
+    print_autotuning_results(_flash_bwd_dq, "backward dQ", 3 * causal_matmul_flops)
+    print_autotuning_results(_flash_bwd_dkdv, "backward dK/dV", 4 * causal_matmul_flops)
 
 
 if __name__ == "__main__":

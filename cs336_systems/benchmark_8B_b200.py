@@ -11,6 +11,7 @@ import triton.runtime as triton_runtime
 
 from cs336_basics.optimizer import AdamW
 from cs336_systems.fsdp import FSDP
+from cs336_systems.fused_adamw import FusedAdamW
 from cs336_systems.model_flash import TransformerLM
 
 
@@ -27,6 +28,7 @@ class Section9Config:
     warmup_ms: int = 10_000
     rep_ms: int = 30_000
     activation_checkpointing: bool = True
+    optimizer: str = "fused-adamw"
 
 
 def _setup(rank: int, world_size: int) -> torch.device:
@@ -73,7 +75,8 @@ def _section9_worker(rank: int, config: Section9Config) -> None:
             device=device,
         )
         fsdp_model = FSDP(model, compute_dtype=torch.bfloat16)
-        optimizer = AdamW(fsdp_model.parameters())
+        optimizer_cls = FusedAdamW if config.optimizer == "fused-adamw" else AdamW
+        optimizer = optimizer_cls(fsdp_model.parameters())
         fsdp_model.train()
 
         # Each rank owns a different sample, giving global batch size two.
@@ -191,6 +194,7 @@ def _section9_worker(rank: int, config: Section9Config) -> None:
             gib = 1024**3
 
             print("benchmark=section9_distributed_do_bench_equivalent")
+            print(f"optimizer={optimizer_cls.__module__}.{optimizer_cls.__name__}")
             print(f"world_size={config.world_size}")
             print(f"global_batch_size={config.global_batch_size}")
             print(f"local_batch_size={local_batch_size}")
@@ -232,6 +236,9 @@ def _parse_args() -> Section9Config:
     parser.add_argument("--warmup-ms", type=int, default=10_000)
     parser.add_argument("--rep-ms", type=int, default=30_000)
     parser.add_argument(
+        "--optimizer", choices=["adamw", "fused-adamw"], default="fused-adamw"
+    )
+    parser.add_argument(
         "--activation-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -244,6 +251,7 @@ def _parse_args() -> Section9Config:
         raise ValueError("rep_ms must be positive")
 
     return Section9Config(
+        optimizer=args.optimizer,
         warmup_ms=args.warmup_ms,
         rep_ms=args.rep_ms,
         activation_checkpointing=args.activation_checkpointing,

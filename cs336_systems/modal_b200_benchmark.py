@@ -82,7 +82,7 @@ def _benchmark_command(profile: str) -> list[str]:
         return [
             sys.executable,
             "-m",
-            "cs336_systems.benchmark_8B_section9",
+            "cs336_systems.benchmark_8B_b200",
             "--warmup-ms",
             "10000",
             "--rep-ms",

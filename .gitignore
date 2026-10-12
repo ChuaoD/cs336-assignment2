@@ -126,6 +126,9 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.uv-cache*/
+.test-tmp*/
+pytest-cache-files-*/
 env/
 venv/
 ENV/

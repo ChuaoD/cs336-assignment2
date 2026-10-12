@@ -1,4 +1,5 @@
 import torch
+import torch.cuda.nvtx as nvtx
 import triton
 import triton.language as tl
 import math
@@ -631,6 +632,7 @@ def _flash_bwd_dkdv(
 
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
+    @nvtx.range("flash attention forward")
     def forward(ctx, Q, K, V, is_causal=False):
         assert Q.ndim == K.ndim == V.ndim == 3
         assert Q.shape[0] == K.shape[0] == V.shape[0]
@@ -643,8 +645,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         batch_size, n_queries, d = Q.shape
         assert d == triton.next_power_of_2(d)
         n_keys = K.shape[-2]
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 64
+        # A100 80GB
+        # (32 heads, 32,768 tokens, head dimension 128, BF16, causal).
+        Q_TILE_SIZE = 128
+        K_TILE_SIZE = 32
         Tq = math.ceil(n_queries / Q_TILE_SIZE)
         L = torch.empty(
             (batch_size, n_queries), 
@@ -674,6 +678,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         return output
 
     @staticmethod
+    @nvtx.range("flash attention backward")
     def backward(ctx, grad_out):
         Q, K, V, output, L = ctx.saved_tensors
         is_causal = ctx.is_causal
@@ -684,9 +689,11 @@ class FlashAttentionTriton(torch.autograd.Function):
         batch_size, n_queries, d = Q.shape
         assert d == triton.next_power_of_2(d)
         n_keys = K.shape[-2]
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 64
-        Tq = math.ceil(n_queries / Q_TILE_SIZE)
+        DQ_Q_TILE_SIZE = 64
+        DQ_K_TILE_SIZE = 64
+        DKDV_Q_TILE_SIZE = 32
+        DKDV_K_TILE_SIZE = 64
+        Tq = math.ceil(n_queries / DQ_Q_TILE_SIZE)
         scale = 1 / math.sqrt(d)
         _flash_bwd_dq[(Tq, batch_size)](
             Q, K, V,
@@ -702,14 +709,14 @@ class FlashAttentionTriton(torch.autograd.Function):
             N_QUERIES=n_queries, N_KEYS=n_keys,
             scale=scale,
             D=d,
-            Q_TILE_SIZE=Q_TILE_SIZE,
-            K_TILE_SIZE=K_TILE_SIZE,
+            Q_TILE_SIZE=DQ_Q_TILE_SIZE,
+            K_TILE_SIZE=DQ_K_TILE_SIZE,
             is_causal=is_causal,
             num_warps=4,
             num_stages=2,
         )
 
-        Tk = math.ceil(n_keys / K_TILE_SIZE)
+        Tk = math.ceil(n_keys / DKDV_K_TILE_SIZE)
         _flash_bwd_dkdv[(Tk, batch_size)](
             Q, K, V,
             grad_out, L, D,
@@ -725,11 +732,11 @@ class FlashAttentionTriton(torch.autograd.Function):
             N_QUERIES=n_queries, N_KEYS=n_keys,
             scale=scale,
             D=d,
-            Q_TILE_SIZE=Q_TILE_SIZE,
-            K_TILE_SIZE=K_TILE_SIZE,
+            Q_TILE_SIZE=DKDV_Q_TILE_SIZE,
+            K_TILE_SIZE=DKDV_K_TILE_SIZE,
             is_causal=is_causal,
             num_warps=4,
-            num_stages=2,
+            num_stages=3,
         )
         
         return dQ, dK, dV, None

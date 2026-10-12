@@ -1,0 +1,15 @@
+world_size=4
+optimizer=cs336_systems.fused_adamw.FusedAdamW
+global_batch_size=4
+local_batch_size=1
+context_length=32768
+num_layers=34
+activation_checkpointing=True
+warmup_steps=1
+measured_steps=3
+max_rank_step_ms=22451.916
+global_tokens_per_second=5837.90
+max_rank_baseline_allocated_gib=23.266
+max_rank_peak_allocated_gib=56.730
+max_rank_peak_reserved_gib=69.174
+final_distributed_mean_loss=12.720284

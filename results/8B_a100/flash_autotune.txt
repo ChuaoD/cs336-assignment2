@@ -1,0 +1,81 @@
+== forward: 42 configs ==
+  Q=128 K= 32  warps=4 stages=2     61.440 ms   143.2 TFLOP/s
+  Q=128 K= 32  warps=4 stages=4     62.491 ms   140.8 TFLOP/s
+  Q=128 K= 32  warps=4 stages=3     62.553 ms   140.6 TFLOP/s
+  Q=128 K= 64  warps=4 stages=2     66.669 ms   131.9 TFLOP/s
+  Q=128 K=128  warps=8 stages=3     68.546 ms   128.3 TFLOP/s
+  Q=128 K= 64  warps=8 stages=2     69.415 ms   126.7 TFLOP/s
+  Q=128 K=128  warps=8 stages=2     69.969 ms   125.7 TFLOP/s
+  Q= 64 K= 64  warps=4 stages=2     74.634 ms   117.9 TFLOP/s
+  Q=128 K= 64  warps=8 stages=3     75.010 ms   117.3 TFLOP/s
+  Q=128 K= 64  warps=8 stages=4     75.288 ms   116.8 TFLOP/s
+  Q=128 K= 32  warps=8 stages=4     78.637 ms   111.9 TFLOP/s
+  Q=128 K= 32  warps=8 stages=2     79.139 ms   111.1 TFLOP/s
+  Q=128 K= 32  warps=8 stages=3     79.238 ms   111.0 TFLOP/s
+  Q= 32 K= 64  warps=4 stages=2     79.704 ms   110.4 TFLOP/s
+  Q= 32 K= 64  warps=4 stages=3     82.598 ms   106.5 TFLOP/s
+  Q= 64 K=128  warps=8 stages=3    102.187 ms    86.1 TFLOP/s
+  Q= 64 K= 32  warps=4 stages=3    104.171 ms    84.4 TFLOP/s
+  Q= 64 K= 32  warps=4 stages=4    104.622 ms    84.1 TFLOP/s
+  Q= 64 K=128  warps=4 stages=3    105.262 ms    83.6 TFLOP/s
+  Q= 64 K=128  warps=8 stages=2    110.295 ms    79.8 TFLOP/s
+  Q= 64 K= 64  warps=4 stages=4    111.018 ms    79.2 TFLOP/s
+  Q= 64 K= 64  warps=4 stages=3    111.135 ms    79.1 TFLOP/s
+  Q= 64 K= 32  warps=4 stages=2    111.705 ms    78.7 TFLOP/s
+  Q= 64 K=128  warps=4 stages=2    114.963 ms    76.5 TFLOP/s
+  Q= 32 K= 64  warps=8 stages=3    116.408 ms    75.6 TFLOP/s
+  Q= 32 K= 64  warps=8 stages=2    121.287 ms    72.5 TFLOP/s
+  Q= 32 K= 64  warps=4 stages=4    125.129 ms    70.3 TFLOP/s
+  Q=128 K= 64  warps=4 stages=4    126.618 ms    69.5 TFLOP/s
+  Q=128 K= 64  warps=4 stages=3    126.736 ms    69.4 TFLOP/s
+  Q= 64 K= 64  warps=8 stages=4    134.356 ms    65.5 TFLOP/s
+  Q= 64 K= 64  warps=8 stages=3    134.513 ms    65.4 TFLOP/s
+  Q= 32 K= 64  warps=8 stages=4    147.256 ms    59.7 TFLOP/s
+  Q= 64 K= 64  warps=8 stages=2    147.989 ms    59.4 TFLOP/s
+  Q= 64 K= 32  warps=8 stages=4    214.967 ms    40.9 TFLOP/s
+  Q= 64 K= 32  warps=8 stages=3    214.993 ms    40.9 TFLOP/s
+  Q= 64 K= 32  warps=8 stages=2    224.214 ms    39.2 TFLOP/s
+  Q=128 K=128  warps=4 stages=2   2353.309 ms     3.7 TFLOP/s
+  Q=128 K=128  warps=4 stages=3   2357.158 ms     3.7 TFLOP/s
+  Q= 64 K=128  warps=4 stages=4  skipped (does not fit)
+  Q= 64 K=128  warps=8 stages=4  skipped (does not fit)
+  Q=128 K=128  warps=4 stages=4  skipped (does not fit)
+  Q=128 K=128  warps=8 stages=4  skipped (does not fit)
+== backward dQ: 20 configs ==
+  Q= 64 K= 64  warps=4 stages=2     72.005 ms   183.2 TFLOP/s
+  Q=128 K= 32  warps=4 stages=2     77.685 ms   169.8 TFLOP/s
+  Q= 32 K= 64  warps=4 stages=2     82.284 ms   160.3 TFLOP/s
+  Q=128 K= 64  warps=8 stages=2     84.201 ms   156.7 TFLOP/s
+  Q=128 K= 64  warps=8 stages=3     86.947 ms   151.7 TFLOP/s
+  Q= 64 K= 64  warps=4 stages=3     88.248 ms   149.5 TFLOP/s
+  Q= 64 K= 32  warps=4 stages=3     95.034 ms   138.8 TFLOP/s
+  Q= 64 K= 32  warps=4 stages=2     95.713 ms   137.9 TFLOP/s
+  Q=128 K= 32  warps=8 stages=3     97.542 ms   135.3 TFLOP/s
+  Q=128 K= 32  warps=8 stages=2    104.380 ms   126.4 TFLOP/s
+  Q= 64 K= 64  warps=8 stages=3    105.187 ms   125.4 TFLOP/s
+  Q= 64 K= 64  warps=8 stages=2    120.045 ms   109.9 TFLOP/s
+  Q= 32 K= 64  warps=8 stages=2    121.282 ms   108.8 TFLOP/s
+  Q=128 K= 32  warps=4 stages=3    122.155 ms   108.0 TFLOP/s
+  Q= 32 K= 64  warps=4 stages=3    126.833 ms   104.0 TFLOP/s
+  Q= 32 K= 64  warps=8 stages=3    131.924 ms   100.0 TFLOP/s
+  Q=128 K= 64  warps=4 stages=3    147.458 ms    89.5 TFLOP/s
+  Q=128 K= 64  warps=4 stages=2    148.603 ms    88.8 TFLOP/s
+  Q= 64 K= 32  warps=8 stages=3    183.659 ms    71.8 TFLOP/s
+  Q= 64 K= 32  warps=8 stages=2    206.158 ms    64.0 TFLOP/s
+== backward dK/dV: 16 configs ==
+  Q= 32 K= 64  warps=4 stages=3    108.850 ms   161.6 TFLOP/s
+  Q= 32 K= 64  warps=4 stages=2    115.449 ms   152.4 TFLOP/s
+  Q= 64 K= 64  warps=8 stages=3    152.111 ms   115.7 TFLOP/s
+  Q= 64 K= 64  warps=4 stages=2    156.857 ms   112.2 TFLOP/s
+  Q= 32 K= 64  warps=8 stages=3    159.311 ms   110.4 TFLOP/s
+  Q= 64 K= 64  warps=8 stages=2    163.836 ms   107.4 TFLOP/s
+  Q= 32 K= 64  warps=8 stages=2    176.418 ms    99.7 TFLOP/s
+  Q= 64 K= 64  warps=4 stages=3    209.629 ms    83.9 TFLOP/s
+  Q= 64 K=128  warps=8 stages=3    250.765 ms    70.2 TFLOP/s
+  Q= 32 K=128  warps=8 stages=2    396.679 ms    44.3 TFLOP/s
+  Q= 32 K=128  warps=8 stages=3    418.448 ms    42.0 TFLOP/s
+  Q= 32 K=128  warps=4 stages=2    443.957 ms    39.6 TFLOP/s
+  Q= 32 K=128  warps=4 stages=3    450.386 ms    39.1 TFLOP/s
+  Q= 64 K=128  warps=8 stages=2    912.611 ms    19.3 TFLOP/s
+  Q= 64 K=128  warps=4 stages=3   4405.417 ms     4.0 TFLOP/s
+  Q= 64 K=128  warps=4 stages=2   4420.291 ms     4.0 TFLOP/s

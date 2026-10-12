@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from jaxtyping import Float, Int
 import math
 import torch
+import torch.cuda.nvtx as nvtx
 from torch import Tensor
 import triton
 import triton.language as tl
@@ -280,6 +281,7 @@ def fused_lm_head_loss_backward_kernel(
 
 class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
     @staticmethod
+    @nvtx.range("fused lm head loss forward")
     def forward(ctx, hidden, weight, targets):
         '''
         hidden: (B, S, D)
@@ -329,6 +331,7 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
         return partial_loss_sums.sum()
 
     @staticmethod
+    @nvtx.range("fused lm head loss backward")
     def backward(ctx, grad_out):
         hidden, weight, targets, lse = ctx.saved_tensors
         flat_hidden = hidden.reshape(-1, hidden.shape[-1])
@@ -369,10 +372,22 @@ class FusedLMHeadCrossEntropyFunction(torch.autograd.Function):
             grad_z_tile = grad_z[:(h_end - h_start), :]
             h_tile = flat_hidden[h_start:h_end, :]
             grad_hidden[h_start:h_end, :] = torch.matmul(grad_z_tile, weight)
-            grad_weight.addmm_(
-                grad_z_tile.T.to(torch.float32),
-                h_tile.to(torch.float32),
-                beta=1.0,
-                alpha=1.0,
+            # The operands are BF16 values converted to FP32. 
+            # TF32 keeps 10 mantissa bits and BF16 has 7, 
+            # so every operand is exact in TF32 and
+            # tensor cores compute this product without losing precision.
+            # FP32 inputs keep full FP32.
+            previous_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = (
+                previous_allow_tf32 or hidden.dtype == torch.bfloat16
             )
+            try:
+                grad_weight.addmm_(
+                    grad_z_tile.T.to(torch.float32),
+                    h_tile.to(torch.float32),
+                    beta=1.0,
+                    alpha=1.0,
+                )
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = previous_allow_tf32
         return grad_hidden.reshape(hidden.shape), grad_weight.to(weight.dtype), None

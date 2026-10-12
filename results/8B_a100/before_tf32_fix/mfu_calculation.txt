@@ -1,0 +1,24 @@
+gpu=NVIDIA A100 80GB SXM
+peak_bf16_tflops_per_gpu=312.0
+num_gpus=4
+global_batch_size=4
+context_length=32768
+num_layers=34
+recomputed_layers=32
+parameters=8125698048
+global_tokens_per_step=131072
+
+component                model PFLOP   impl. PFLOP
+block_matmuls                  5.411         7.109
+attention_forward              1.196         2.322
+attention_backward             2.393         4.187
+lm_head_forward                0.163         0.163
+lm_head_backward               0.326         0.489
+total                          9.489        14.271
+
+step_ms=24107.591
+global_tokens_per_second=5436.96
+model_tflops_per_gpu=98.4
+implementation_tflops_per_gpu=148.0
+mfu=0.3154
+hfu=0.4743

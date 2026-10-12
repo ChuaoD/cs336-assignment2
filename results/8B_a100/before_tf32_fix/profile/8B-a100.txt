@@ -1,0 +1,83 @@
+database=8B-a100.sqlite
+ranks=4
+profiled_steps=2
+layers_from_trace=34
+recomputed_layers_from_trace=32
+local_batch_size=1
+context_length=32768
+
+== Step time per rank (CPU range of each profiled step) ==
+rank (GPU)        mean step ms
+------------------------------
+GPU 0                  24225.2
+GPU 1                  24224.9
+GPU 2                  24225.4
+GPU 3                  24224.5
+
+== Phase time (GPU span of kernels launched in each NVTX range) ==
+phase                                    ms/step    % step
+----------------------------------------------------------
+forward                                   5716.4     23.6%
+backward                                 18465.2     76.2%
+  of which recomputation                  4160.8     17.2%
+finish_gradient_synchronization             13.8      0.1%
+optimizer                                   34.9      0.1%
+step                                     24225.0    100.0%
+
+== GPU time by kernel category (summed durations; streams can overlap) ==
+category                       ms/step    % step  exec TFLOP/s    % peak
+------------------------------------------------------------------------
+attention forward               4089.3     16.9%         142.0     45.5%
+attention backward              6325.1     26.1%         165.5     53.0%
+block gemms                     6325.0     26.1%         281.0     90.1%
+lm head + loss forward          1235.4      5.1%          33.0     10.6%
+lm head + loss backward         2628.1     10.8%          46.6     14.9%
+optimizer                         34.6      0.1%
+other kernels                   3373.7     13.9%
+memcpy                            62.7      0.3%
+memset                             0.9      0.0%
+nccl communication              1145.8      4.7%
+
+== Timeline utilization (fraction of step wall time) ==
+rank (GPU)       compute busy    comm busy   exposed comm      idle
+-------------------------------------------------------------------
+GPU 0                   99.6%         4.1%           0.4%      0.1%
+GPU 1                   99.3%         4.8%           0.6%      0.1%
+GPU 2                   99.6%         3.9%           0.3%      0.1%
+GPU 3                   99.0%         6.0%           0.9%      0.1%
+mean                    99.4%         4.7%           0.5%      0.1%
+Exposed communication includes NCCL kernels waiting for slower ranks.
+
+profiled_mfu=0.3139
+profiled_hfu=0.4720
+
+== Top 20 kernels and copies by GPU time ==
+name                                                                            category   ms/step  calls/step   mean us
+------------------------------------------------------------------------------------------------------------------------
+_flash_fwd                                                             attention forward    4089.3          66   61959.0
+_flash_bwd_dkdv                                                       attention backward    3721.0          34  109442.4
+_flash_bwd_dq                                                         attention backward    2501.8          34   73583.4
+ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn                  block gemms    2413.8         396    6095.4
+ampere_sgemm_128x128_nt                                          lm head + loss backward    2167.2         128   16931.3
+ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_nt                  block gemms    1627.3         238    6837.5
+elementwise_kernel                                                         other kernels    1612.6        2390     674.7
+vectorized_elementwise_kernel                                              other kernels    1438.3        3449     417.0
+fused_lm_head_loss_forward_kernel                                 lm head + loss forward    1235.4           1 1235382.9
+ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_nn                  block gemms     903.7         170    5315.8
+ncclDevKernel_AllGather_RING_LL                                       nccl communication     787.3         704    1118.3
+ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_nn                  block gemms     702.0          68   10324.1
+ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_tn                  block gemms     678.2          66   10275.2
+ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL                          nccl communication     322.7         240    1344.6
+fused_lm_head_loss_backward_kernel                               lm head + loss backward     276.2         128    2157.6
+unrolled_elementwise_kernel                                                other kernels     221.4         578     383.1
+ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_64x3_nn      lm head + loss backward     154.2         128    1204.9
+reduce_kernel                                                              other kernels      89.9         271     331.7
+memcpy Device-to-Device                                                           memcpy      59.3         504     117.7
+unrolled_elementwise_kernel                                           attention backward      55.6          68     817.2
+
+== Memory copies and sets ==
+kind                                     ms/step  calls/step
+------------------------------------------------------------
+memcpy Device-to-Device                    59.30         504
+memcpy Host-to-Device                       3.42         264
+memset                                      0.87         440
